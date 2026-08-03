@@ -1,0 +1,5 @@
+-e .
+jupyter>=1.0
+matplotlib>=3.4
+pyreadstat>=1.2
+diff-diff==3.0.2

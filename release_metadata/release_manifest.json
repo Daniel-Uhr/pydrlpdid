@@ -1,0 +1,45 @@
+{
+  "release": "pydrlpdid 0.7.2",
+  "deliverables": [
+    {
+      "filename": "Application_1_Bacon_pydrlpdid_v0.7.2_LOCAL_H19.ipynb",
+      "bytes": 67548,
+      "sha256": "a404d9b8f9145fab2b065878706bdd19043558ff1aaf812bc670fd2c75ce68e1"
+    },
+    {
+      "filename": "Application_2_Dube_and_Formal_Switching_pydrlpdid_v0.7.2.ipynb",
+      "bytes": 90211,
+      "sha256": "57332d06e66f032ff5def419dc476e1bbdd547771a44a6c050d882fdfa9588cb"
+    },
+    {
+      "filename": "Monte_Carlo_DRLPDID_pydrlpdid_v0.7.2_FINAL.ipynb",
+      "bytes": 79132,
+      "sha256": "12336d47b90498afb5ebdfc341bcf22fbeb94cb0f2d0b52e52cca378167ceb7c"
+    },
+    {
+      "filename": "monte_carlo_absorbing_N500.py",
+      "bytes": 10887,
+      "sha256": "713eb3540cac19b3fea564370ec5bf08c7197336c14fb86da51c9c5c2b0fa17b"
+    },
+    {
+      "filename": "pydrlpdid-0.7.2-complete.zip",
+      "bytes": 1770302,
+      "sha256": "6c6506c1789c78ad3dc2ee0bb7c3586a3940435c7e2c43bb8e8a29bb240cdc7f"
+    },
+    {
+      "filename": "pydrlpdid-0.7.2-notebooks.zip",
+      "bytes": 45243,
+      "sha256": "3e1e2ec907ed385bace8fd9558897ce5ef7f3433e8729405afaafd0d5390c1f6"
+    },
+    {
+      "filename": "pydrlpdid-0.7.2-py3-none-any.whl",
+      "bytes": 47535,
+      "sha256": "c5dbd4af09fb9c558f517e7fc16e4ba9dbe1cbc627d958b9501ade50c769b99c"
+    },
+    {
+      "filename": "pydrlpdid-0.7.2-source.zip",
+      "bytes": 124632,
+      "sha256": "b332518144deb6da8317bdba23fae0d10652b21e1521b6f7fc55eb7c53c615aa"
+    }
+  ]
+}
