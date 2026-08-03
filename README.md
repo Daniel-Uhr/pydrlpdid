@@ -6,6 +6,14 @@ sustained treatment switch-ins.
 
 ## Installation
 
+Clone the repository and install the package in editable mode:
+
+```bash
+git clone https://github.com/Daniel-Uhr/pydrlpdid.git
+cd pydrlpdid
+pip install -e .
+````
+
 ### Windows: install from the repository folder
 
 1. Choose **Code > Download ZIP** on GitHub.
