@@ -1,0 +1,11 @@
+pydrlpdid 0.7.2 replacement repository validation
+Date: 2026-08-03
+
+Source installation from repository root: PASS
+Wheel installation: PASS
+Pytest: PASS (10 tests)
+Import check: PASS
+Version check: PASS (0.7.2)
+
+Recommended command after downloading and extracting the GitHub repository:
+    py -m pip install .
