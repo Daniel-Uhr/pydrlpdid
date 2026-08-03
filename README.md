@@ -1,8 +1,7 @@
 # pydrlpdid 0.7.2
 
 `pydrlpdid` implements the local semiparametric estimators developed in
-*Doubly Robust Local Projections Difference-in-Differences: Staggered
-Adoption and Treatment Switching*.
+*Doubly Robust Local Projections Difference-in-Differences: Staggered Adoption and Sustained Switch-Ins*.
 
 Version 0.7.2 deliberately exposes a small formal API. The five estimator
 identities in `DRLPDID` use the same horizon-specific supported event stack:
