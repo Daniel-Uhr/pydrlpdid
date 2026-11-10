@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.8.0rc1
+
+- Separates observed treatment history from the explicit `diff_diff`
+  compatibility convention; initial treated levels are never inferred to be
+  switch-ins under the default.
+- Replaces the ambiguous left-censoring `keep` option with
+  `keep_as_control_after_L` and preserves the old spelling only as a deprecated
+  alias in the panel utility.
+- Makes the common OR slope the default and exposes calendar-interacted slopes
+  by name.
+- Requires an explicit `post_aggregation` whenever `post_window` is requested.
+- Uses one RA design for point estimation and influence-function inference.
+- Applies optional CR1 scaling to the complete cluster influence function.
+- Adds multiplier inference for both pooled and mean-of-horizons scalars.
+- Enforces the configured Jacobian condition-number limit.
+- Reports local propensity, control-odds, effective-sample-size, rank, and
+  small-sample diagnostics.
+- Exposes optional separate PS and OR covariate bases and a concise
+  `outcome_change_lags` option.
+- Prevents placebo regressions from conditioning on generated outcome changes
+  that are algebraic components of the placebo dependent variable.
+- Adds deterministic four-scenario Monte Carlo validation with recorded seeds,
+  failures, timing, bias, variance, RMSE, coverage, and interval length.
+
 ## 0.7.2
 
 - Separates the literature estimator `LPDID-RA` from the formal common-stack

@@ -130,10 +130,11 @@ def stacked_influence(
     rank = int(np.sum(singular_values > tol))
     min_sv = float(singular_values[-1]) if singular_values.size else 0.0
     cond = float(np.inf if min_sv == 0 else singular_values[0] / min_sv)
-    if rank < A.shape[0] or not np.isfinite(cond):
+    if rank < A.shape[0] or not np.isfinite(cond) or cond > condition_limit:
         raise JacobianError(
-            f"Stacked Jacobian is singular: rank={rank}/{A.shape[0]}, "
-            f"condition={cond:.3e}, min_singular_value={min_sv:.3e}."
+            f"Stacked Jacobian is singular or ill-conditioned: "
+            f"rank={rank}/{A.shape[0]}, condition={cond:.3e}, "
+            f"limit={condition_limit:.3e}, min_singular_value={min_sv:.3e}."
         )
     Ainv = np.linalg.inv(A)
     if target_grad is None:

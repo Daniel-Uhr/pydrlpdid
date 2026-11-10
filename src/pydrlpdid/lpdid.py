@@ -71,7 +71,7 @@ from ._panel_utils import (
     z_crit,
 )
 from ._results import LPDIDResults
-from ._errors import ExperimentalFeatureError
+from ._errors import ExperimentalFeatureError, InferenceError
 
 
 # ---------------------------------------------------------------------------
@@ -101,16 +101,13 @@ def _make_row(h: int, est: float, se: float, z: float) -> dict:
 # ---------------------------------------------------------------------------
 
 def _cluster_fit(model, groups: pd.Series):
-    """OLS/WLS with cluster-robust SE; falls back to standard SE on failure."""
+    """OLS/WLS with cluster-robust SE; inference failures are explicit."""
     try:
         return model.fit(cov_type="cluster", cov_kwds={"groups": groups})
     except Exception as exc:
-        warnings.warn(
-            f"Cluster SE failed ({type(exc).__name__}: {exc}). "
-            "Falling back to standard errors.",
-            stacklevel=2,
-        )
-        return model.fit()
+        raise InferenceError(
+            f"Cluster-robust inference failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _ctrl_cols(covariates: Optional[List[str]], ldy: bool, n: int) -> List[str]:
@@ -216,9 +213,13 @@ def _influence_linear(
         target_grad=lambda th: np.eye(len(th))[idx],
     )
     psi = infl["psi"].reshape(-1)
+    _n = int(X.shape[0]); _k = int(X.shape[1]); _G = int(pd.unique(s[unit]).size)
+    _cr1 = np.sqrt((_G / (_G - 1.0)) * ((_n - 1.0) / (_n - _k))) if _G > 1 and _n > _k else 1.0
+    psi = _cr1 * psi
     return {
         "se": se_from_influence(psi),
         "psi_by_cluster": pd.Series(psi, index=pd.Index(infl["cluster_labels"])),
+        "small_sample_factor": float(_cr1),
     }
 
 
@@ -226,14 +227,23 @@ def _influence_linear(
 # RA local estimation (regression-adjustment imputation)
 # ---------------------------------------------------------------------------
 
-def _fit_ra(
+def _independent_columns(x: np.ndarray) -> np.ndarray:
+    """Return a deterministic, original-order full-rank column subset."""
+    keep: List[int] = []
+    rank = 0
+    for j in range(x.shape[1]):
+        candidate = x[:, keep + [j]]
+        new_rank = int(np.linalg.matrix_rank(candidate))
+        if new_rank > rank:
+            keep.append(j)
+            rank = new_rank
+    return np.asarray(keep, dtype=int)
+
+
+def _ra_components(
     local: pd.DataFrame, unit: str, time: str, controls: List[str]
 ) -> dict:
-    """RA-LP-DiD imputation at one horizon (Dube et al. 2025, eq. 11).
-
-    Estimates :math:`\\hat{m}_0` on clean controls; the ATT is the mean
-    treated residual :math:`\\bar{Y}_1 - \\overline{\\hat{m}_0}`.
-    """
+    """Build the single certified sample/design used by RA point and inference."""
     # RA imputation requires a control in every time cell used: m0 carries the
     # time fixed effect, which is unidentified for a treated-only cell. Restrict
     # to time cells with at least one control (treated units in control-less
@@ -241,13 +251,54 @@ def _fit_ra(
     # such cells to match reghdfe; RA cannot.
     _hc = local.loc[local["D_local"] == 0].groupby(time).size()
     local = local.loc[local[time].isin(_hc.loc[_hc > 0].index)].copy()
-    ctrl = local.loc[local["D_local"] == 0].copy()
-    if ctrl.empty:
+    if local.empty:
+        raise ValueError("No usable time cell for RA estimation.")
+    y_df, z_df = patsy.dmatrices(
+        _formula("outcome_local", None, time, controls),
+        local,
+        return_type="dataframe",
+        NA_action="raise",
+    )
+    y = np.asarray(y_df, dtype=float).reshape(-1)
+    d = local["D_local"].to_numpy(dtype=float)
+    control = d == 0
+    treated = d == 1
+    if not np.any(control):
         raise ValueError("No clean controls for RA estimation.")
-    fit_or = smf.ols(_formula("outcome_local", None, time, controls), data=ctrl).fit()
-    m0 = np.asarray(fit_or.predict(local), dtype=float)
-    resid = local["outcome_local"].to_numpy(dtype=float) - m0
-    return {"estimate": float(np.mean(resid[local["D_local"].to_numpy() == 1]))}
+    if not np.any(treated):
+        raise ValueError("No treated observations for RA estimation.")
+    z_full = np.asarray(z_df, dtype=float)
+    keep = _independent_columns(z_full[control])
+    if keep.size == 0:
+        raise ValueError("The RA control design has zero rank.")
+    z = z_full[:, keep]
+    beta = np.linalg.lstsq(z[control], y[control], rcond=None)[0]
+    residual = y - z @ beta
+    estimate = float(np.mean(residual[treated]))
+    return {
+        "local": local,
+        "y": y,
+        "d": d,
+        "z": z,
+        "beta": beta,
+        "estimate": estimate,
+        "retained_columns": [str(z_df.columns[j]) for j in keep],
+        "dropped_columns": [
+            str(z_df.columns[j]) for j in range(z_full.shape[1]) if j not in set(keep)
+        ],
+    }
+
+
+def _fit_ra(
+    local: pd.DataFrame, unit: str, time: str, controls: List[str]
+) -> dict:
+    """RA-LP-DiD imputation at one horizon (Dube et al. 2025, eq. 11)."""
+    comp = _ra_components(local, unit, time, controls)
+    return {
+        "estimate": comp["estimate"],
+        "retained_columns": comp["retained_columns"],
+        "dropped_columns": comp["dropped_columns"],
+    }
 
 
 def _influence_ra(
@@ -262,24 +313,10 @@ def _influence_ra(
         m_1(\\boldsymbol{\\beta}) &= (1-D_i)(Y_i-Z_i\\boldsymbol{\\beta})Z_i \\\\
         m_2(\\mu_1,\\boldsymbol{\\beta}) &= D_i(Y_i-Z_i\\boldsymbol{\\beta}-\\mu_1)
     """
-    # Same control-in-every-cell restriction as _fit_ra (RA imputation cannot
-    # use treated-only time cells).
-    _hc = local.loc[local["D_local"] == 0].groupby(time).size()
-    local = local.loc[local[time].isin(_hc.loc[_hc > 0].index)].copy()
-    y = local["outcome_local"].to_numpy(dtype=float)
-    d = local["D_local"].to_numpy(dtype=float)
-    fit_or = smf.ols(
-        _formula("outcome_local", None, time, controls),
-        data=local.loc[d == 0],
-    ).fit()
-    Z = np.asarray(
-        patsy.build_design_matrices(
-            [fit_or.model.data.design_info], local, return_type="dataframe"
-        )[0],
-        dtype=float,
-    )
-    beta = np.asarray(fit_or.params, dtype=float)
-    mu1 = float(np.mean((y - Z @ beta)[d == 1]))
+    comp = _ra_components(local, unit, time, controls)
+    local = comp["local"]
+    y, d, Z, beta = comp["y"], comp["d"], comp["z"], comp["beta"]
+    mu1 = comp["estimate"]
     theta = np.concatenate([beta, [mu1]])
 
     def moments(th):
@@ -296,9 +333,16 @@ def _influence_ra(
         target_grad=lambda th: np.eye(len(th))[-1],
     )
     psi = infl["psi"].reshape(-1)
+    n = int(len(local)); k = int(len(theta)); g = int(local[unit].nunique())
+    cr1 = np.sqrt((g / (g - 1.0)) * ((n - 1.0) / (n - k))) if g > 1 and n > k else 1.0
+    psi = cr1 * psi
     return {
+        "estimate": mu1,
         "se": se_from_influence(psi),
         "psi_by_cluster": pd.Series(psi, index=pd.Index(infl["cluster_labels"])),
+        "small_sample_factor": float(cr1),
+        "retained_columns": comp["retained_columns"],
+        "dropped_columns": comp["dropped_columns"],
     }
 
 
@@ -316,13 +360,15 @@ def _fit_horizon(
     """Estimate ATT-h, SE, and cluster influence for one horizon."""
     zero = pd.Series(0.0, index=cluster_universe)
     if estimand == "ra":
-        est = _fit_ra(local, unit, time, controls)["estimate"]
-        se = np.nan
-        psi = zero
         if compute_influence:
             infl = _influence_ra(local, unit, time, controls)
+            est = infl["estimate"]
             se = infl["se"]
             psi = infl["psi_by_cluster"].reindex(cluster_universe, fill_value=0.0)
+        else:
+            est = _fit_ra(local, unit, time, controls)["estimate"]
+            se = np.nan
+            psi = zero
     else:
         r = _fit_linear(local, unit, time, controls, estimand, pre_rw)
         est, se = r["estimate"], r["se"]
@@ -341,28 +387,33 @@ def _fit_horizon(
 def _avg_scalar(
     event_df: pd.DataFrame, psi_by_h: Dict[int, pd.Series],
     cluster_universe: pd.Index, z: float, compute_influence: bool,
-) -> list[dict]:
+) -> tuple[list[dict], Dict[str, pd.Series]]:
     post = event_df.loc[
         (event_df["horizon"] >= 0) & np.isfinite(event_df["estimate"])
     ]
     if post.empty:
-        return []
+        return [], {}
     post_h = post["horizon"].astype(int).tolist()
     avg = float(np.mean(post["estimate"].to_numpy(dtype=float)))
     se = np.nan
+    scalar_psi: Dict[str, pd.Series] = {}
     if compute_influence:
         Psi = np.column_stack([
             psi_by_h[h].reindex(cluster_universe, fill_value=0.0).to_numpy(dtype=float)
             for h in post_h
         ])
-        se = se_from_influence(np.mean(Psi, axis=1))
+        avg_psi = np.mean(Psi, axis=1)
+        se = se_from_influence(avg_psi)
+        scalar_psi["ATT avg"] = pd.Series(
+            avg_psi, index=cluster_universe, dtype=float
+        )
     t = avg / se if np.isfinite(se) and se > 0 else np.nan
     return [{
         "term": "ATT avg", "estimate": avg, "se": se, "t_stat": t,
         "p_value": p_value_two_sided(t) if np.isfinite(t) else np.nan,
         "ci_lower": avg - z * se if np.isfinite(se) else np.nan,
         "ci_upper": avg + z * se if np.isfinite(se) else np.nan,
-    }]
+    }], scalar_psi
 
 
 def _build_pooled_local(
@@ -460,12 +511,13 @@ def _pooled_scalar(
     control_pool: str = "stabilized_all",
     switch_in: str = "sustained",
     control_window: str = "horizon",
-) -> list[dict]:
+    cluster_universe: Optional[pd.Index] = None,
+) -> tuple[list[dict], Dict[str, pd.Series]]:
     finite_post = event_df.loc[
         (event_df["horizon"] >= 0) & np.isfinite(event_df["estimate"]), "horizon"
     ].tolist()
     if not finite_post:
-        return []
+        return [], {}
     pw = int(max(finite_post))
     pl = _build_pooled_local(
         df, outcome, unit, time, pw, base_period,
@@ -477,18 +529,28 @@ def _pooled_scalar(
         control_window=control_window,
     )
     if pl.empty or pl["D_local"].sum() == 0:
-        return []
+        return [], {}
 
+    scalar_psi: Dict[str, pd.Series] = {}
     if estimand == "ra":
         est = _fit_ra(pl, unit, time, controls)["estimate"]
         se = np.nan
         if compute_influence:
-            se = _influence_ra(pl, unit, time, controls)["se"]
+            infl = _influence_ra(pl, unit, time, controls)
+            est, se = infl["estimate"], infl["se"]
+            scalar_psi["ATT pooled"] = infl["psi_by_cluster"]
     else:
         r = _fit_linear(pl, unit, time, controls, estimand)
         est, se = r["estimate"], r["se"]
         if compute_influence:
-            se = _influence_linear(pl, unit, time, controls, estimand)["se"]
+            infl = _influence_linear(pl, unit, time, controls, estimand)
+            se = infl["se"]
+            scalar_psi["ATT pooled"] = infl["psi_by_cluster"]
+
+    if compute_influence and cluster_universe is not None:
+        scalar_psi["ATT pooled"] = scalar_psi["ATT pooled"].reindex(
+            cluster_universe, fill_value=0.0
+        )
 
     t = est / se if np.isfinite(se) and se > 0 else np.nan
     return [{
@@ -496,7 +558,7 @@ def _pooled_scalar(
         "p_value": p_value_two_sided(t) if np.isfinite(t) else np.nan,
         "ci_lower": est - z * se if np.isfinite(se) else np.nan,
         "ci_upper": est + z * se if np.isfinite(se) else np.nan,
-    }]
+    }], scalar_psi
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +747,8 @@ class LPDID:
         support_policy: str = "supported_subset",
         left_censoring: str = "error",
         time_policy: str = "calendar",
+        history_policy: str = "observed",
+        pre_weighting: str = "horizon_specific",
     ) -> None:
         self.target_estimand = str(target_estimand).lower()
         if self.target_estimand not in self._VALID_ESTIMANDS:
@@ -732,6 +796,14 @@ class LPDID:
             raise ValueError("support_policy must be 'strict' or 'supported_subset'.")
         self.left_censoring = str(left_censoring).lower()
         self.time_policy = str(time_policy).lower()
+        self.history_policy = str(history_policy).lower()
+        if self.history_policy not in {"observed", "diff_diff"}:
+            raise ValueError("history_policy must be 'observed' or 'diff_diff'.")
+        self.pre_weighting = str(pre_weighting).lower()
+        if self.pre_weighting not in {"post_target", "horizon_specific"}:
+            raise ValueError(
+                "pre_weighting must be 'post_target' or 'horizon_specific'."
+            )
 
     # ------------------------------------------------------------------
     def _prepare(self, data, outcome, unit, time, first_treat, treatment, covariates):
@@ -747,6 +819,7 @@ class LPDID:
             ),
             left_censoring=self.left_censoring,
             time_policy=self.time_policy,
+            history_policy=self.history_policy,
         )
         return df, covariates
 
@@ -775,6 +848,8 @@ class LPDID:
         cu = pd.Index(df[unit].dropna().unique())  # cluster universe
         psi_by_h: Dict[int, pd.Series] = {}
         rows: list[dict] = []
+        omitted_overlapping_outcome_controls: dict[int, tuple[str, ...]] = {}
+        control_unit_ids: set = set()
 
         # Fixed composition (Section 3.6): hold the unit set across horizons
         # by fixing control membership at t+H and dropping late treated events.
@@ -812,9 +887,16 @@ class LPDID:
             pre_horizons.remove(self.base_period)
 
         for h in pre_horizons + post_horizons:
+            overlapping = {
+                f"ldy{k}" for k in range(1, -int(h))
+            } if h < -1 else set()
+            controls_h = [c for c in controls if c not in overlapping]
+            omitted = tuple(sorted(overlapping.intersection(controls)))
+            if omitted:
+                omitted_overlapping_outcome_controls[int(h)] = omitted
             local = build_local_sample(
                 df, outcome, unit, time, h, self.base_period,
-                self.clean_control, self.effect_stabilization, controls,
+                self.clean_control, self.effect_stabilization, controls_h,
                 user_covariates=covariates,
                 lag_covariates=self.lag_covariates,
                 fixed_composition_H=fc_H,
@@ -844,10 +926,18 @@ class LPDID:
                 continue
             if unsupported_times:
                 local = local.loc[~local[time].isin(unsupported_times)].copy()
+            control_unit_ids.update(
+                local.loc[local["D_local"].eq(0), unit].tolist()
+            )
 
             # Pre-period RW: map h=0 time-cell weights to this stack
             pre_rw: Optional[pd.Series] = None
-            if self.target_estimand == "rw" and h < 0 and rw0_map is not None:
+            if (
+                self.pre_weighting == "post_target"
+                and self.target_estimand == "rw"
+                and h < 0
+                and rw0_map is not None
+            ):
                 tmp0 = build_local_sample(
                     df, outcome, unit, time, 0, self.base_period,
                     self.clean_control, self.effect_stabilization, controls,
@@ -866,7 +956,7 @@ class LPDID:
                     pre_rw = local[time].map(tmap)
 
             est, se, psi = _fit_horizon(
-                local, unit, time, controls, self.target_estimand,
+                local, unit, time, controls_h, self.target_estimand,
                 compute_influence, cu, pre_rw=pre_rw,
             )
             psi_by_h[int(h)] = psi
@@ -896,8 +986,10 @@ class LPDID:
                 stacklevel=2,
             )
 
-        scalar_rows = _avg_scalar(event_df, psi_by_h, cu, z, compute_influence)
-        scalar_rows += _pooled_scalar(
+        scalar_rows, psi_by_scalar = _avg_scalar(
+            event_df, psi_by_h, cu, z, compute_influence
+        )
+        pooled_rows, pooled_psi = _pooled_scalar(
             df, outcome, unit, time, event_df, self.base_period,
             self.clean_control, self.effect_stabilization, controls,
             self.target_estimand, z, compute_influence,
@@ -906,22 +998,31 @@ class LPDID:
             control_pool=self.control_pool,
             switch_in=self.switch_in,
             control_window=self.control_window,
+            cluster_universe=cu,
         )
+        scalar_rows += pooled_rows
+        psi_by_scalar.update(pooled_psi)
 
         return {
             "panel": df, "event_study": event_df,
             "scalars": pd.DataFrame(scalar_rows),
             "psi_by_h": psi_by_h,
+            "psi_by_scalar": psi_by_scalar,
             "cluster_universe": cu,
             "n_obs": int(df.shape[0]),
             "n_treated_units": int(df.loc[df["_treated_ever"] == 1, unit].nunique()),
-            "n_control_units": int(df.loc[df["_never_treated"] == 1, unit].nunique()),
+            "n_control_units": int(len(control_unit_ids)),
             "n_cohorts": int(df.loc[df["_first_treat"] > 0, "_first_treat"].nunique()),
             "n_periods": int(df[time].nunique()),
             "fixed_composition": bool(self.fixed_composition),
             "support_policy": self.support_policy,
             "left_censoring": self.left_censoring,
             "time_policy": self.time_policy,
+            "history_policy": self.history_policy,
+            "pre_weighting": self.pre_weighting,
+            "omitted_overlapping_outcome_controls": (
+                omitted_overlapping_outcome_controls
+            ),
             "nonabsorbing_certified": bool(self.clean_control == "stabilized"),
             "treatment_design": (
                 "recurrent_sustained_switch_in"
@@ -1021,6 +1122,37 @@ class LPDID:
                 "n_bootstrap": self.n_bootstrap,
                 "simultaneous_band_horizons": tuple(band_horizons),
             }
+            if not scalars.empty:
+                scalars["multiplier_ci_lower"] = np.nan
+                scalars["multiplier_ci_upper"] = np.nan
+                scalars["multiplier_p_value"] = np.nan
+                scalar_terms: list[str] = []
+                for idx, row in scalars.iterrows():
+                    term = str(row["term"])
+                    psi_scalar = core["psi_by_scalar"].get(term)
+                    se_scalar = float(row["se"])
+                    if (
+                        psi_scalar is None
+                        or not np.isfinite(se_scalar)
+                        or se_scalar <= 0
+                    ):
+                        continue
+                    mb_scalar = run_multiplier_bootstrap(
+                        np.asarray([float(row["estimate"])]),
+                        psi_scalar.reindex(
+                            core["cluster_universe"], fill_value=0.0
+                        ).to_numpy(dtype=float)[:, None],
+                        np.asarray([se_scalar]),
+                        self.n_bootstrap,
+                        self.bootstrap_weights,
+                        self.alpha,
+                        rng,
+                    )
+                    scalars.loc[idx, "multiplier_ci_lower"] = mb_scalar["ci_lower"][0]
+                    scalars.loc[idx, "multiplier_ci_upper"] = mb_scalar["ci_upper"][0]
+                    scalars.loc[idx, "multiplier_p_value"] = mb_scalar["p_values"][0]
+                    scalar_terms.append(term)
+                multiplier_metadata["scalar_terms"] = tuple(scalar_terms)
 
         if self.inference == "cluster_bootstrap":
             event_df, scalars = _cluster_bootstrap(
@@ -1038,7 +1170,7 @@ class LPDID:
             label += " [non-absorbing]"
 
         metadata = {
-            "package_version": "0.7.2",
+            "package_version": "0.8.0rc1",
             "estimator_identity": (
                 "dube_2025_lpdid_ra"
                 if self.target_estimand == "ra"
@@ -1052,6 +1184,12 @@ class LPDID:
             "nonabsorbing_control_window": "horizon" if self.clean_control == "stabilized" else None,
             "nonabsorbing_control_pool": "stabilized_all" if self.clean_control == "stabilized" else None,
             "estimand_weighting": "eligible_switch_in_events" if self.clean_control == "stabilized" else "treated_entries",
+            "history_policy": core.get("history_policy"),
+            "left_censoring": core.get("left_censoring"),
+            "pre_weighting": core.get("pre_weighting"),
+            "omitted_overlapping_outcome_controls": core.get(
+                "omitted_overlapping_outcome_controls", {}
+            ),
         }
         if multiplier_metadata is not None:
             metadata["multiplier"] = multiplier_metadata

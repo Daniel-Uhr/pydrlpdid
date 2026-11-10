@@ -76,7 +76,7 @@ class EventStudyResults:
         lines.append("")
         lines.append(f"Validated panel rows:     {self.n_obs:>24}")
         lines.append(f"Ever-treated units:       {self.n_treated_units:>24}")
-        lines.append(f"Never-treated units:      {self.n_control_units:>24}")
+        lines.append(f"Distinct clean controls:  {self.n_control_units:>24}")
         lines.append(f"First-onset dates:        {self.n_cohorts:>24}")
         lines.append(f"Time periods:             {self.n_periods:>24}")
         lines.append(f"Base period:              {str(self.base_period):>24}")

@@ -1,4 +1,31 @@
-# Running the 0.7.2 replication files
+# Running replication files
+
+## 0.8.0rc1 validation
+
+From the repository root, run the complete test suite:
+
+```powershell
+$env:PYTHONPATH="src"
+python -m pytest tests -q -p no:cacheprovider
+```
+
+Run a short Monte Carlo smoke test:
+
+```powershell
+python replication\monte_carlo_v080.py --replications 2 --units 200 --jobs 1 --output-dir results\v080_smoke
+```
+
+Run the prespecified scientific validation:
+
+```powershell
+python replication\monte_carlo_v080.py --replications 200 --units 1000 --jobs 4 --output-dir results\v080_final_R200_N1000
+```
+
+The driver saves the raw replication rows, summary metrics, all failures, and
+a JSON environment/configuration record. Seeds are deterministic numeric maps;
+Python's session-dependent `hash()` is not used.
+
+## Historical 0.7.2 article files
 
 Open a terminal in the extracted `pydrlpdid-0.7.2` directory.
 

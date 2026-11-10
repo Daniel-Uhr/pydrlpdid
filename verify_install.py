@@ -1,4 +1,4 @@
-"""Minimal post-installation check for pydrlpdid 0.7.2."""
+"""Minimal post-installation check for pydrlpdid 0.8.0rc1."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sys
 import pydrlpdid
 from pydrlpdid import DRLPDID, LPDID
 
-EXPECTED_VERSION = "0.7.2"
+EXPECTED_VERSION = "0.8.0rc1"
 
 
 def main() -> int:

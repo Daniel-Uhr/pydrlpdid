@@ -18,7 +18,7 @@ Verify the installation:
 py -c "import pydrlpdid; from pydrlpdid import DRLPDID, LPDID; print(pydrlpdid.__version__); print(pydrlpdid.__file__)"
 ```
 
-The expected version is `0.7.2`.
+The expected release-candidate version is `0.8.0rc1`.
 
 ## Development installation
 
@@ -34,5 +34,5 @@ folder. After downloading the wheel from a GitHub Release, open PowerShell in
 the download folder and run:
 
 ```powershell
-py -m pip install .\pydrlpdid-0.7.2-py3-none-any.whl
+py -m pip install .\pydrlpdid-0.8.0rc1-py3-none-any.whl
 ```

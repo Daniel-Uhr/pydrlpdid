@@ -54,6 +54,22 @@ within a numerical tolerance certified by the measured retained-basis
 imbalance, the fitted outcome coefficients, and floating-point roundoff;
 otherwise estimation stops.
 
+## Post-window aggregation
+
+A scalar `post_window=(lo, hi)` is estimated with `post_aggregation`:
+
+- `"pooled"` (default; Dube et al. 2025, sec. 3.5). One common sample: the
+  reference dates and treated/control masks of horizon `hi`, with the outcome
+  equal to the average long difference `mean_h (Y_{t+h} - Y_{t-1})`, h in
+  `[lo, hi]`. The local event propensity model and the outcome regression are
+  estimated once on this common stack, and the scalar is the estimator on that
+  stack. The event study keeps its horizon-specific stacks and nuisances.
+- `"mean_horizons"`. Average of the horizon-specific estimates, each with its own
+  stack and nuisances. This is a different estimand whenever the stacks differ.
+
+For RA the pooled scalar equals the common-stack regression of the averaged
+long difference, which is the diff-diff `post_pooled` estimator.
+
 ## Inference
 
 Analytic influence functions are aggregated by physical panel unit. Multiplier

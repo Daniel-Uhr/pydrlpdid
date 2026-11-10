@@ -170,19 +170,38 @@ def prepare_panel(
     *,
     left_censoring: str = "error",
     time_policy: str = "calendar",
+    history_policy: str = "observed",
 ) -> pd.DataFrame:
     """Validate and augment a long panel using exact calendar-time shifts.
 
     ``time_policy='calendar'`` permits gaps but never substitutes a later row
     for a missing calendar period. ``'strict'`` rejects any within-unit gap.
-    ``left_censoring`` is ``'error'`` (default) or ``'drop'``.
+    ``left_censoring`` is ``'error'`` (default), ``'drop'``, or
+    ``'keep_as_control_after_L'``. ``history_policy='observed'`` never treats
+    an unobserved pre-sample transition as a zero transition. The
+    ``'diff_diff'`` policy is an explicit compatibility convention.
     """
     if first_treat is None and treatment is None:
         raise TreatmentValidationError("Provide either `first_treat` or `treatment`.")
-    if left_censoring not in {"error", "drop"}:
-        raise ValueError("left_censoring must be 'error' or 'drop'.")
+    left_censoring = str(left_censoring).lower()
+    if left_censoring == "keep":
+        warnings.warn(
+            "left_censoring='keep' is deprecated; use "
+            "'keep_as_control_after_L'.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        left_censoring = "keep_as_control_after_l"
+    if left_censoring not in {"error", "drop", "keep_as_control_after_l"}:
+        raise ValueError(
+            "left_censoring must be 'error', 'drop', or "
+            "'keep_as_control_after_L'."
+        )
     if time_policy not in {"calendar", "strict"}:
         raise ValueError("time_policy must be 'calendar' or 'strict'.")
+    history_policy = str(history_policy).lower()
+    if history_policy not in {"observed", "diff_diff"}:
+        raise ValueError("history_policy must be 'observed' or 'diff_diff'.")
     req = [outcome, unit, time] + ([first_treat] if first_treat else []) + ([treatment] if treatment else [])
     check_columns(data, req)
     if data[[unit, time]].isna().any().any():
@@ -201,6 +220,7 @@ def prepare_panel(
         raise PanelValidationError("time must be finite.")
     df.attrs["_panel_unit"] = unit
     df.attrs["_panel_time"] = time
+    df.attrs["_history_policy"] = history_policy
     df["_observed_row"] = 1
 
     if time_policy == "strict":
@@ -230,9 +250,10 @@ def prepare_panel(
                    "so first treatment is left-censored. Supply `first_treat` or use left_censoring='drop'.")
             if left_censoring == "error":
                 raise TreatmentValidationError(msg)
-            warnings.warn(msg + " Dropping them.", stacklevel=2)
-            df = df.loc[~df[unit].isin(already_on)].copy()
-            raw_treat = pd.to_numeric(df[treatment], errors="coerce")
+            if left_censoring != "keep_as_control_after_l":
+                warnings.warn(msg + " Dropping them.", stacklevel=2)
+                df = df.loc[~df[unit].isin(already_on)].copy()
+                raw_treat = pd.to_numeric(df[treatment], errors="coerce")
 
     if first_treat is None:
         df["_first_treat_internal"] = _derive_first_treat(df, unit, time, treatment)
@@ -254,14 +275,16 @@ def prepare_panel(
         msg = f"{len(left_units)} unit(s) have first_treat before their first observed period."
         if left_censoring == "error":
             raise TreatmentValidationError(msg)
-        warnings.warn(msg + " Dropping them.", stacklevel=2)
-        df = df.loc[~df[unit].isin(left_units)].copy()
-        if treatment is not None:
-            raw_treat = pd.to_numeric(df[treatment], errors="coerce")
+        if left_censoring != "keep_as_control_after_l":
+            warnings.warn(msg + " Dropping them.", stacklevel=2)
+            df = df.loc[~df[unit].isin(left_units)].copy()
+            if treatment is not None:
+                raw_treat = pd.to_numeric(df[treatment], errors="coerce")
 
     df = sort_panel(df, unit, time)
     df.attrs["_panel_unit"] = unit
     df.attrs["_panel_time"] = time
+    df.attrs["_history_policy"] = history_policy
     df["_first_obs_time"] = df.groupby(unit, sort=False)[time].transform("min")
     df["_left_censored"] = 0
 
@@ -276,7 +299,16 @@ def prepare_panel(
             if bad.any():
                 raise TreatmentValidationError("first_treat is inconsistent with the observed first treatment onset.")
         prev = lag(df, unit, "_treat", 1)
-        df["D_treat"] = df["_treat"] - prev
+        if history_policy == "diff_diff":
+            # Compatibility convention used by diff-diff: the first observed
+            # level is differenced against zero.
+            df["D_treat"] = df["_treat"] - prev.fillna(0.0)
+        else:
+            # Formal observed-history convention. A first-row treatment level
+            # does not reveal a 0->1 transition and therefore cannot create an
+            # event. After L fully observed transition-free periods, an
+            # initially treated unit may enter the stable-one control pool.
+            df["D_treat"] = df["_treat"] - prev
     else:
         expected = ((df["_first_treat"] > 0) & (df[time] >= df["_first_treat"])).astype(int)
         if treatment is not None:
@@ -384,10 +416,15 @@ def precompute_ccs(
     """
     out = df.copy()
     out.attrs.update(df.attrs)
+    history_policy = str(out.attrs.get("_history_policy", "observed"))
     ccs0 = pd.Series(True, index=out.index)
     for k in range(1, effect_stabilization + 1):
         z = lag(out, unit, "D_treat", k)
-        ccs0 = ccs0 & z.notna() & (z.abs() != 1)
+        if history_policy == "diff_diff":
+            z = z.fillna(0)
+            ccs0 = ccs0 & (z.abs() != 1)
+        else:
+            ccs0 = ccs0 & z.notna() & (z.abs() != 1)
     out["CCS_0"] = ccs0.astype(int)
 
     for h in range(1, max_post + 1):
@@ -398,9 +435,16 @@ def precompute_ccs(
 
     out["CCS_m1"] = out["CCS_0"]
     for h in range(2, max_pre + 1):
-        prev = out[f"CCS_m{h-1}"] == 1
-        lag_prev = lag(out, unit, f"CCS_m{h-1}", 1) == 1
-        out[f"CCS_m{h}"] = (prev & lag_prev).astype(int)
+        win = max(int(effect_stabilization), h)
+        ok = pd.Series(True, index=out.index)
+        for k in range(1, win + 1):
+            z = lag(out, unit, "D_treat", k)
+            if history_policy == "diff_diff":
+                z = z.fillna(0)
+                ok = ok & (z.abs() != 1)
+            else:
+                ok = ok & z.notna() & (z.abs() != 1)
+        out[f"CCS_m{h}"] = ok.astype(int)
     return out
 
 
@@ -460,6 +504,7 @@ def build_local_sample(
         ``outcome_local`` (long-differenced outcome).
     """
     s = df.copy()
+    history_policy = str(s.attrs.get("_history_policy", "observed"))
     s["outcome_local"] = compute_long_difference(s, outcome, unit, h, base_period)
 
     # --- fixed-composition pre-computation (Section 3.6) ----------------
@@ -508,7 +553,20 @@ def build_local_sample(
         # controls by CCS_mj; using CCS_0 for leads would admit events whose
         # required pre-history is incomplete or contaminated.
         treated_ccs_col = "CCS_0" if h >= 0 else f"CCS_m{abs(h)}"
-        treat_mask = (s["D_treat"] == 1) & (s[treated_ccs_col] == 1)
+        treat_mask = (s["D_treat"] == 1) & ((s[treated_ccs_col] == 1) if h < 0 else True)
+        if h < 0:
+            treat_mask = (s["D_treat"] == 1)
+            for j in range(1, max(int(effect_stabilization), -h) + 1):
+                prior = lag(s, unit, "_treat", j)
+                if history_policy == "diff_diff":
+                    prior = prior.fillna(0)
+                treat_mask = treat_mask & (prior == 0)
+        if h >= 0:
+            for j in range(1, int(effect_stabilization) + 1):
+                prior = lag(s, unit, "_treat", j)
+                if history_policy == "diff_diff":
+                    prior = prior.fillna(0)
+                treat_mask = treat_mask & (prior == 0)
         # Exclude phantom switches created by missing raw treatment.
         if "_treat_obs" in s.columns:
             treat_mask = treat_mask & (s["_treat_obs"] == 1)
@@ -590,7 +648,11 @@ def build_local_sample(
         # (Dube et al. 2025, eq. 13; appendix_sim_LPDiD_estimation.do lines 31-35).
         # The CCS indicator already guarantees the required stability window;
         # an additional exposure-age filter is not needed and not in the paper.
-        ctrl_mask = (s["D_treat"] == 0) & stable_mask
+        if h >= 0 or history_policy == "observed":
+            ctrl_mask = (s["D_treat"] == 0) & stable_mask
+        else:
+            # Explicit diff-diff compatibility convention for placebo leads.
+            ctrl_mask = stable_mask
         # Exclude phantom control rows from missing raw treatment.
         if "_treat_obs" in s.columns:
             ctrl_mask = ctrl_mask & (s["_treat_obs"] == 1)

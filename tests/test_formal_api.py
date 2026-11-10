@@ -4,7 +4,9 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from pydrlpdid import DRLPDID, __version__
+from pydrlpdid import DRLPDID, LPDID, __version__
+from pydrlpdid._errors import JacobianError
+from pydrlpdid._inference import stacked_influence
 from pydrlpdid._panel_utils import (
     build_local_sample,
     precompute_ccs,
@@ -52,7 +54,7 @@ def switching_panel():
 
 class FormalAPITests(unittest.TestCase):
     def test_version_and_constructor_are_narrow(self):
-        self.assertEqual(__version__, "0.7.2")
+        self.assertEqual(__version__, "0.8.0rc1")
         parameters = set(inspect.signature(DRLPDID).parameters)
         self.assertEqual(
             parameters,
@@ -63,6 +65,12 @@ class FormalAPITests(unittest.TestCase):
                 "stabilization_window",
                 "horizons",
                 "post_window",
+                "post_aggregation",
+                "outcome_change_lags",
+                "or_slope_structure",
+                "history_policy",
+                "left_censoring",
+                "small_sample_correction",
                 "inference",
                 "n_bootstrap",
                 "alpha",
@@ -132,6 +140,7 @@ class FormalAPITests(unittest.TestCase):
             estimation_method="dr-ipw",
             horizons=(-2, 2),
             post_window=(0, 2),
+            post_aggregation="mean_horizons",
             inference="cluster",
         ).fit(
             df, outcome="y", unit="id", time="time",
@@ -155,13 +164,18 @@ class FormalAPITests(unittest.TestCase):
             estimation_method="ipt",
             horizons=(-2, 2),
             post_window=(0, 2),
+            post_aggregation="mean_horizons",
             inference="cluster",
         ).fit(**fit_kwargs)
+        # The identity IPT == DR-IPT holds when the common-slope OR basis is
+        # nested in the IPT balancing span.
         dript = DRLPDID(
             estimation_method="dr-ipt",
             horizons=(-2, 2),
             post_window=(0, 2),
+            post_aggregation="mean_horizons",
             inference="cluster",
+            or_slope_structure="common",
         ).fit(**fit_kwargs)
         supported = ipt.event_study["horizon"] != -1
         differences = np.abs(
@@ -244,6 +258,23 @@ class FormalAPITests(unittest.TestCase):
         self.assertTrue(
             ((controls_t5["id"] == 2) & (controls_t5["_treat"] == 1)).any()
         )
+
+
+class TimeVaryingSlopeTests(unittest.TestCase):
+    def test_calendar_interacted_slopes_break_nesting(self):
+        df = absorbing_panel()
+        df["x_duplicate"] = df["x"]
+        kwargs = dict(
+            data=df, outcome="y", unit="id", time="time", first_treat="g",
+            covariates=["x", "x_duplicate"],
+        )
+        est = DRLPDID(
+            estimation_method="dr-ipt", horizons=(-2, 2), post_window=(0, 2),
+            post_aggregation="mean_horizons", inference="cluster",
+            or_slope_structure="calendar_interacted",
+        ).fit(**kwargs)
+        flags = [d["ipt_dript_nested_basis"] for d in est.metadata["nuisance_diagnostics"].values()]
+        self.assertFalse(any(flags))
 
 
 if __name__ == "__main__":

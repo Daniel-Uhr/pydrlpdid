@@ -1,94 +1,61 @@
-# pydrlpdid 0.7.2
+# pydrlpdid 0.8.0rc1
 
-`pydrlpdid` implements doubly robust local-projections
-Difference-in-Differences estimators for staggered absorbing adoption and
-sustained treatment switch-ins.
+`pydrlpdid` estimates local-projection Difference-in-Differences effects for
+staggered absorbing adoption and sustained treatment switch-ins. The formal
+API contains RA, IPW, IPT, DR-IPW, and DR-IPT estimators on one common
+horizon-specific comparison stack.
 
-## Installation
+## Install
 
-Clone the repository and install the package in editable mode:
-
-```bash
-git clone https://github.com/Daniel-Uhr/pydrlpdid.git
-cd pydrlpdid
-pip install -e .
-````
-
-### Windows: install from the repository folder
-
-1. Choose **Code > Download ZIP** on GitHub.
-2. Extract the ZIP.
-3. Open PowerShell in the extracted folder containing `pyproject.toml`.
-4. Run:
+From the repository folder containing `pyproject.toml`:
 
 ```powershell
-py -m pip install --upgrade pip
-py -m pip install .
+python -m pip install -e ".[dev]"
+python -m pytest -q
 ```
 
-Verify:
+If `python` is not Python 3.10 on Windows, use its full executable path:
 
 ```powershell
-py verify_install.py
+& "C:\Users\danie\AppData\Local\Programs\Python\Python310\python.exe" -m pip install -e ".[dev]"
 ```
 
-The expected version is `0.7.2`.
-
-For an editable development installation:
-
-```powershell
-py -m pip install -e ".[dev]"
-py -m pytest -q
-```
-
-A wheel installation command should be used only after the wheel has actually
-been downloaded from a GitHub Release. See `INSTALL_WINDOWS.md`.
-
-## Estimators
-
-The formal `DRLPDID` API provides:
-
-- `ra`: regression adjustment;
-- `ipw`: logit inverse-probability weighting;
-- `ipt`: inverse-probability tilting;
-- `dr-ipw`: logit-based doubly robust estimation;
-- `dr-ipt`: IPT--WLS doubly robust estimation.
-
-Only `dr-ipw` and `dr-ipt` carry the double-robustness property, conditional on
-the identifying assumptions.
-
-`LPDID` remains available as the literature benchmark API. In particular,
-`LPDID(target_estimand="ra")` is the Dube et al. regression-adjustment
-benchmark, while `DRLPDID(estimation_method="ra")` is the regression-only
-member of the common supported local-ATT stack.
-
-## Minimal import
-
-```python
-from pydrlpdid import DRLPDID, LPDID
-```
-
-## Absorbing staggered adoption
+## Minimal use
 
 ```python
 from pydrlpdid import DRLPDID
 
 result = DRLPDID(
     estimation_method="dr-ipt",
-    design="absorbing",
-    control_group="not_yet_treated",
-    horizons=(-10, 19),
-    post_window=(0, 19),
+    horizons=(-5, 10),
     inference="multiplier",
-    n_bootstrap=999,
     seed=123,
 ).fit(
-    data=df,
-    outcome="asmrs",
-    unit="state",
+    df,
+    outcome="y",
+    unit="id",
     time="year",
-    first_treat="first_treat",
-    covariates=["pcinc", "asmrh", "cases"],
+    first_treat="first_treat",  # 0 for never treated
+    covariates=["x1", "x2"],
+)
+
+print(result.summary())
+event_study = result.event_study
+```
+
+To request a post-treatment scalar, name its estimand explicitly:
+
+```python
+result = DRLPDID(
+    estimation_method="dr-ipt",
+    horizons=(-5, 10),
+    post_window=(0, 10),
+    post_aggregation="mean_horizons",  # or "pooled"
+    inference="multiplier",
+    seed=123,
+).fit(
+    df, outcome="y", unit="id", time="year",
+    first_treat="first_treat", covariates=["x1", "x2"],
 )
 ```
 
@@ -98,26 +65,50 @@ result = DRLPDID(
 result = DRLPDID(
     estimation_method="dr-ipt",
     design="switching",
-    stabilization_window=20,
-    horizons=(-10, 15),
-    post_window=(0, 10),
-    inference="multiplier",
-    n_bootstrap=999,
-    seed=123,
+    stabilization_window=2,
+    horizons=(-2, 5),
+    history_policy="observed",
+    inference="cluster",
 ).fit(
-    data=df,
-    outcome="growth",
-    unit="country",
+    df,
+    outcome="y",
+    unit="id",
     time="year",
-    treatment="democracy",
-    covariates=["lag1y", "lag2y", "lag3y", "lag4y"],
+    treatment="treatment",
+    covariates=["x1", "x2"],
 )
 ```
 
-## Replication
+An initial treated level is not an observed switch. Choose the treatment of
+left-censored spells explicitly with `left_censoring="error"` (default),
+`"drop"`, or `"keep_as_control_after_L"`.
 
-See `RUN_REPLICATION.md` for the article notebooks and certified Monte Carlo
-workflow.
+## Advanced nuisance specifications
+
+`covariates` supplies the same predetermined variables to both nuisance
+models. For diagnostics or research designs that require distinct bases, use
+`ps_covariates=` and `or_covariates=` in `fit`. Generated lagged outcome
+changes can be requested with `outcome_change_lags=`, but any change that is
+an algebraic component of a placebo outcome is omitted and recorded in
+metadata.
+
+## Estimators and inference
+
+- `ra`: regression adjustment;
+- `ipw`: logit inverse-probability weighting;
+- `ipt`: inverse-probability tilting;
+- `dr-ipw`: logit-based doubly robust estimation;
+- `dr-ipt`: IPT/WLS doubly robust estimation.
+
+`LPDID` remains the Dube et al. literature benchmark (`vw`, `rw`, and `ra`).
+Its default RW weights are horizon-specific; `pre_weighting="post_target"` is
+an explicit compatibility option.
+
+The default formal covariance has no degrees-of-freedom correction. Set
+`small_sample_correction="cr1"` to scale the full influence representation,
+including scalar and multiplier inference.
+
+See `FORMAL_SPEC_0.8.0.md`, `MIGRATION_0.8.0.md`, and `RUN_REPLICATION.md`.
 
 ## License
 
