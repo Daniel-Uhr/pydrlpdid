@@ -1,4 +1,4 @@
-# pydrlpdid 0.8.0rc3
+# pydrlpdid 0.8.0
 
 `pydrlpdid` estimates local-projection Difference-in-Differences effects for
 staggered absorbing adoption and sustained treatment switch-ins. The formal
