@@ -31,7 +31,8 @@ import numpy as np
 import pandas as pd
 from scipy.special import expit
 
-from pydrlpdid import DRLPDID, LPDID, __version__
+from pydrlpdid import DRLPDID, __version__
+from pydrlpdid.lpdid import _LPDIDEngine
 
 PACKAGE_SOURCE_FILE = Path(
     sys.modules[DRLPDID.__module__].__file__
@@ -186,7 +187,7 @@ def _fit_lpdid(
     *,
     max_post: int,
 ) -> dict[str, Any]:
-    result = LPDID(
+    result = _LPDIDEngine(
         target_estimand="rw",
         base_period=-1,
         clean_control="not_yet_treated",

@@ -33,13 +33,6 @@ def _one_comparison(design: str, estimand: str) -> dict:
     reweight = estimand in {"rw", "ra"}
     correction = "none" if estimand == "ra" else "cr1"
 
-    pyd_kwargs = dict(
-        target_estimand=estimand,
-        max_pre=2,
-        max_post=2,
-        history_policy="diff_diff",
-        small_sample_correction=correction,
-    )
     dd_kwargs = dict(
         pre_window=2,
         post_window=2,
@@ -58,25 +51,23 @@ def _one_comparison(design: str, estimand: str) -> dict:
     )
 
     if design == "absorbing":
-        pyd_kwargs["clean_control"] = "not_yet_treated"
+        pass
     elif design == "first_entry":
-        pyd_kwargs["clean_control"] = "first_entry"
         dd_kwargs["non_absorbing"] = "first_entry"
     elif design == "effect_stabilization":
-        pyd_kwargs.update(
-            clean_control="stabilized", effect_stabilization=2
-        )
         dd_kwargs.update(
             non_absorbing="effect_stabilization", stabilization_window=2
         )
     else:  # pragma: no cover - guarded by the fixed design matrix below
         raise ValueError(design)
 
-    pyd = LPDID(**pyd_kwargs).fit(**fit_kwargs)
+    pyd = LPDID(
+        **dd_kwargs, small_sample_correction=correction
+    ).fit(**fit_kwargs)
     dd = DiffDiffLPDiD(**dd_kwargs).fit(**fit_kwargs)
 
     event = pyd.event_study.merge(dd.event_study, on="horizon", suffixes=("_pyd", "_dd"))
-    pooled_pyd = pyd.scalars.loc[pyd.scalars["term"].eq("ATT pooled")].iloc[0]
+    pooled_pyd = pyd.pooled.loc[pyd.pooled["window"].eq("post")].iloc[0]
     pooled_dd = dd.pooled.loc[dd.pooled["window"].eq("post")].iloc[0]
 
     row = {
@@ -84,11 +75,17 @@ def _one_comparison(design: str, estimand: str) -> dict:
         "design": design,
         "estimand": estimand,
         "small_sample_correction": correction,
-        "event_max_abs_estimate": _max_abs(event["estimate"], event["coefficient"]),
+        "event_max_abs_estimate": _max_abs(
+            event["estimate"], event["coefficient_dd"]
+        ),
         "event_max_abs_se": _max_abs(event["se_pyd"], event["se_dd"]),
         "event_max_abs_p_value": _max_abs(event["p_value_pyd"], event["p_value_dd"]),
-        "event_max_abs_ci_lower": _max_abs(event["ci_lower"], event["conf_low"]),
-        "event_max_abs_ci_upper": _max_abs(event["ci_upper"], event["conf_high"]),
+        "event_max_abs_ci_lower": _max_abs(
+            event["ci_lower"], event["conf_low_dd"]
+        ),
+        "event_max_abs_ci_upper": _max_abs(
+            event["ci_upper"], event["conf_high_dd"]
+        ),
         "pooled_abs_estimate": abs(
             float(pooled_pyd["estimate"]) - float(pooled_dd["coefficient"])
         ),

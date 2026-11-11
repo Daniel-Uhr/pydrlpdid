@@ -59,6 +59,30 @@ class EventStudyResults:
     scalars: pd.DataFrame = field(default_factory=pd.DataFrame)
     metadata: dict = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Expose diff-diff column aliases without removing native names."""
+        if not self.event_study.empty:
+            aliases = {
+                "event_time": "horizon",
+                "att": "estimate",
+                "coefficient": "estimate",
+                "conf_low": "ci_lower",
+                "conf_high": "ci_upper",
+            }
+            for alias, native in aliases.items():
+                if alias not in self.event_study and native in self.event_study:
+                    self.event_study[alias] = self.event_study[native]
+        if not self.scalars.empty:
+            aliases = {
+                "att": "estimate",
+                "coefficient": "estimate",
+                "conf_low": "ci_lower",
+                "conf_high": "ci_upper",
+            }
+            for alias, native in aliases.items():
+                if alias not in self.scalars and native in self.scalars:
+                    self.scalars[alias] = self.scalars[native]
+
     @property
     def event_study_effects(self) -> pd.DataFrame:
         return self.event_study
@@ -66,6 +90,11 @@ class EventStudyResults:
     @property
     def scalar_summaries(self) -> pd.DataFrame:
         return self.scalars
+
+    @property
+    def aggregates(self) -> pd.DataFrame:
+        """All requested pre/post summaries with their explicit weighting rule."""
+        return self.scalars.copy()
 
     @property
     def pooled(self) -> pd.DataFrame:
@@ -76,20 +105,76 @@ class EventStudyResults:
         if "window" not in out:
             term = out.get("term", pd.Series("", index=out.index)).astype(str).str.lower()
             out["window"] = np.where(term.str.contains("pre"), "pre", "post")
+        if "aggregation" in out:
+            pooled_rows = out["aggregation"].astype(str).eq("pooled")
+            out = out.loc[pooled_rows].copy()
+        elif "term" in out:
+            pooled_rows = out["term"].astype(str).str.contains("pooled", case=False)
+            if pooled_rows.any():
+                out = out.loc[pooled_rows].copy()
         if "coefficient" not in out and "estimate" in out:
             out["coefficient"] = out["estimate"]
         if "conf_low" not in out and "ci_lower" in out:
             out["conf_low"] = out["ci_lower"]
         if "conf_high" not in out and "ci_upper" in out:
             out["conf_high"] = out["ci_upper"]
-        return out
+        order = pd.Categorical(out["window"], categories=["pre", "post"], ordered=True)
+        return out.assign(_window_order=order).sort_values(
+            "_window_order"
+        ).drop(columns="_window_order").reset_index(drop=True)
 
     def _post_row(self) -> Optional[pd.Series]:
-        pooled = self.pooled
-        if pooled.empty:
+        if self.scalars.empty:
             return None
-        post = pooled.loc[pooled["window"] == "post"]
-        return None if post.empty else post.iloc[0]
+        candidates = self.scalars.copy()
+        if "window" not in candidates:
+            term = candidates.get(
+                "term", pd.Series("", index=candidates.index)
+            ).astype(str).str.lower()
+            candidates["window"] = np.where(
+                term.str.contains("pre"), "pre", "post"
+            )
+        post = candidates.loc[candidates["window"] == "post"]
+        if post.empty:
+            return None
+        primary = str(self.metadata.get("primary_post_aggregation", "pooled"))
+        if "aggregation" in post:
+            selected = post.loc[post["aggregation"].astype(str).eq(primary)]
+            if not selected.empty:
+                return selected.iloc[0]
+        # Backward compatibility for result objects created before aggregation
+        # labels were public.
+        if primary == "pooled" and "term" in post:
+            selected = post.loc[
+                post["term"].astype(str).str.contains("pooled", case=False)
+            ]
+            if not selected.empty:
+                return selected.iloc[0]
+        return post.iloc[0]
+
+    def aggregate(self, window: str = "post", aggregation: str = "pooled") -> pd.Series:
+        """Return one named aggregate without changing the headline ATT."""
+        window = str(window).lower()
+        aggregation = str(aggregation).lower().replace("-", "_")
+        aliases = {
+            "mean_horizons": "equal_horizon",
+            "equal_horizons": "equal_horizon",
+            "treated_event": "event_weighted",
+        }
+        aggregation = aliases.get(aggregation, aggregation)
+        if window not in {"pre", "post"}:
+            raise ValueError("window must be 'pre' or 'post'.")
+        if self.scalars.empty or "aggregation" not in self.scalars:
+            raise KeyError("No labeled aggregate summaries are available.")
+        selected = self.scalars.loc[
+            self.scalars["window"].astype(str).eq(window)
+            & self.scalars["aggregation"].astype(str).eq(aggregation)
+        ]
+        if selected.empty:
+            raise KeyError(
+                f"Aggregate ({window!r}, {aggregation!r}) was not requested."
+            )
+        return selected.iloc[0].copy()
 
     @property
     def att(self) -> float:
@@ -118,6 +203,61 @@ class EventStudyResults:
             return (float("nan"), float("nan"))
         return (float(row["ci_lower"]), float(row["ci_upper"]))
 
+    @property
+    def conf_int_lower(self) -> float:
+        return float(self.conf_int[0])
+
+    @property
+    def conf_int_upper(self) -> float:
+        return float(self.conf_int[1])
+
+    @property
+    def event_study_df(self) -> dict[int, float]:
+        """Per-horizon inference degrees of freedom (diff-diff convention)."""
+        if self.event_study.empty or "df" not in self.event_study:
+            return {}
+        return {
+            int(row["horizon"]): float(row["df"])
+            for _, row in self.event_study.iterrows()
+            if np.isfinite(row.get("df", np.nan))
+        }
+
+    @property
+    def pooled_df(self) -> dict[str, float]:
+        """Pre/post scalar degrees-of-freedom provenance."""
+        pooled = self.pooled
+        if pooled.empty or "df" not in pooled:
+            return {}
+        out: dict[str, float] = {}
+        for _, row in pooled.iterrows():
+            value = row.get("df", np.nan)
+            if np.isfinite(value):
+                out[str(row["window"])] = float(value)
+        return out
+
+    def to_dict(self) -> dict:
+        """Serialize headline results using diff-diff-compatible names."""
+        result = {
+            "att": self.att,
+            "se": self.se,
+            "t_stat": self.t_stat,
+            "p_value": self.p_value,
+            "conf_int_lower": self.conf_int_lower,
+            "conf_int_upper": self.conf_int_upper,
+            "n_obs": int(self.n_obs),
+            "n_treated_units": int(self.n_treated_units),
+            "n_control_units": int(self.n_control_units),
+            "event_study_df": self.event_study_df,
+            "pooled_df": self.pooled_df,
+            "inference_method": self.inference,
+        }
+        result.update({
+            "control_group": self.metadata.get("control_group", self.clean_control),
+            "cluster_name": self.metadata.get("cluster_level"),
+            "df_convention": self.metadata.get("df_convention", "cluster"),
+        })
+        return result
+
     def to_dataframe(self, level: str = "event_study") -> pd.DataFrame:
         """Return a defensive copy of event-study or pooled results."""
         level = str(level).lower()
@@ -125,7 +265,11 @@ class EventStudyResults:
             return self.event_study.copy()
         if level == "pooled":
             return self.pooled.copy()
-        raise ValueError("level must be 'event_study' or 'pooled'.")
+        if level in {"aggregate", "aggregates", "scalar", "scalars"}:
+            return self.aggregates
+        raise ValueError(
+            "level must be 'event_study', 'pooled', or 'aggregates'."
+        )
 
     @property
     def bootstrap_n_requested(self) -> Optional[int]:

@@ -33,8 +33,19 @@ def multiplier_weights(
     raise ValueError("weight_type must be one of {'rademacher','mammen','webb'}.")
 
 
-def resample_clusters(df: pd.DataFrame, cluster_col: str, rng: np.random.Generator) -> pd.DataFrame:
-    """Paired cluster resampling with replacement and unique bootstrap IDs."""
+def resample_clusters(
+    df: pd.DataFrame,
+    cluster_col: str,
+    rng: np.random.Generator,
+    panel_unit: Optional[str] = None,
+) -> pd.DataFrame:
+    """Paired cluster resampling with replacement and unique bootstrap IDs.
+
+    When the inference cluster is coarser than the physical panel unit, every
+    selected cluster brings all of its units.  Unit identifiers are relabelled
+    within each bootstrap draw so that selecting the same cluster more than
+    once does not create duplicate unit-time observations.
+    """
     clusters = pd.Index(df[cluster_col].drop_duplicates())
     if len(clusters) == 0:
         return df.copy()
@@ -42,6 +53,10 @@ def resample_clusters(df: pd.DataFrame, cluster_col: str, rng: np.random.Generat
     pieces = []
     for b, cid in enumerate(sampled):
         part = df.loc[df[cluster_col] == cid].copy()
+        if panel_unit is not None and panel_unit != cluster_col:
+            part[panel_unit] = part[panel_unit].map(
+                lambda value: f"boot_{b}_{value}"
+            )
         part[cluster_col] = f"boot_{b}_{cid}"
         pieces.append(part)
     return pd.concat(pieces, axis=0, ignore_index=True)
@@ -96,14 +111,20 @@ def stacked_influence(
     *,
     condition_limit: float = 1e12,
 ) -> dict:
-    """Compute cluster-level influence functions for a just-identified system.
+    """Compute the cluster sandwich for a just-identified moment system.
 
     The influence sign follows ``-A^{-1} score``. Singular or severely
     ill-conditioned Jacobians are errors rather than silently pseudo-inverted.
-    The returned contributions implement the article's uncorrected
-    cluster-sandwich formula.  In particular, no degrees-of-freedom factor
-    depending on the dimension of the chosen moment representation is applied.
-    This makes inference invariant to algebraically redundant nuisance blocks.
+    The returned cluster contributions implement the uncorrected sandwich
+
+    ``A^{-1} (sum_g S_g S_g') A^{-1}' / n^2``,
+
+    where ``A`` is the Jacobian of the mean moments and ``S_g`` is the sum of
+    observation-level moments in cluster ``g``.  Finite-sample corrections are
+    deliberately applied by the estimator, after it has selected the relevant
+    parameter count.  Returning the bread, meat, and covariance makes the
+    inferential calculation auditable instead of exposing only a standard
+    error.
     """
     theta_hat = np.asarray(theta_hat, dtype=float)
     m_i = np.asarray(moments_obs_func(theta_hat), dtype=float)
@@ -138,14 +159,37 @@ def stacked_influence(
             f"limit={condition_limit:.3e}, min_singular_value={min_sv:.3e}."
         )
     Ainv = np.linalg.inv(A)
+    meat = (S.T @ S) / float(n ** 2)
+    covariance_full = Ainv @ meat @ Ainv.T
+    common = {
+        "jacobian": A,
+        "bread": Ainv,
+        "meat": meat,
+        "n_obs": int(n),
+        "n_clusters": int(len(cluster_labels)),
+        "jacobian_rank": rank,
+        "jacobian_condition": cond,
+    }
     if target_grad is None:
         psi = -(S @ Ainv.T) / n
-        return {"cluster_labels": cluster_labels, "psi": psi}
+        return {
+            "cluster_labels": cluster_labels,
+            "psi": psi,
+            "covariance": covariance_full,
+            **common,
+        }
 
     g = np.asarray(target_grad(theta_hat), dtype=float).reshape(-1, 1)
     v = (Ainv.T @ g).reshape(-1)
     psi_tau = -(S @ v) / n
-    return {"cluster_labels": cluster_labels, "psi": psi_tau.reshape(-1, 1)}
+    covariance_target = g.T @ covariance_full @ g
+    return {
+        "cluster_labels": cluster_labels,
+        "psi": psi_tau.reshape(-1, 1),
+        "covariance": covariance_target,
+        "target_gradient": g.reshape(-1),
+        **common,
+    }
 
 
 def se_from_influence(psi: np.ndarray) -> float:
@@ -208,12 +252,13 @@ def run_multiplier_bootstrap(
 def run_cluster_bootstrap(
     fit_func,
     data: pd.DataFrame,
-    unit: str,
+    cluster_col: str,
     n_bootstrap: int,
     alpha: float,
     rng: np.random.Generator,
     original_estimates: dict,
     min_success_rate: float = 0.90,
+    panel_unit: Optional[str] = None,
 ) -> dict:
     """Paired cluster bootstrap for event-study paths and scalar summaries."""
     event_index = list(original_estimates["event_index"])
@@ -224,7 +269,9 @@ def run_cluster_bootstrap(
     failures: Counter[str] = Counter()
     n_successful = 0
     for _ in range(n_bootstrap):
-        boot_df = resample_clusters(data, unit, rng)
+        boot_df = resample_clusters(
+            data, cluster_col, rng, panel_unit=panel_unit
+        )
         try:
             boot = fit_func(boot_df)
         except Exception as exc:  # recorded, never silently treated as a draw

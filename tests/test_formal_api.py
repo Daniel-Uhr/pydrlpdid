@@ -4,7 +4,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from pydrlpdid import DRLPDID, LPDID, __version__
+from pydrlpdid import DRLPDID, __version__
 from pydrlpdid._errors import JacobianError
 from pydrlpdid._inference import stacked_influence
 from pydrlpdid._panel_utils import (
@@ -54,7 +54,7 @@ def switching_panel():
 
 class FormalAPITests(unittest.TestCase):
     def test_version_and_constructor_are_narrow(self):
-        self.assertEqual(__version__, "0.8.0rc3")
+        self.assertEqual(__version__, "0.8.1")
         parameters = set(inspect.signature(DRLPDID).parameters)
         self.assertEqual(
             parameters,
@@ -64,16 +64,21 @@ class FormalAPITests(unittest.TestCase):
                 "design",
                 "control_group",
                 "cluster",
+                "rank_deficient_action",
+                "df_convention",
                 "non_absorbing",
                 "stabilization_window",
                 "horizons",
                 "post_window",
                 "aggregate_window",
+                "pre_aggregation",
                 "post_aggregation",
                 "outcome_change_lags",
                 "or_slope_structure",
                 "history_policy",
                 "left_censoring",
+                "or_training_support",
+                "unsupported_event_policy",
                 "small_sample_correction",
                 "inference",
                 "bootstrap_weights",
@@ -116,6 +121,34 @@ class FormalAPITests(unittest.TestCase):
         for table in counts[1:]:
             pd.testing.assert_frame_equal(table, counts[0])
 
+    def test_unsupported_event_policy_is_explicit(self):
+        df = absorbing_panel()
+        df.loc[df["g"].eq(0), "g"] = int(df["time"].max())
+        df["w"] = ((df["g"] > 0) & (df["time"] >= df["g"])).astype(int)
+
+        dropped = DRLPDID(
+            estimation_method="ra",
+            horizons=(-2, 0),
+            unsupported_event_policy="drop",
+        ).fit(
+            df, outcome="y", unit="id", time="time",
+            first_treat="g", covariates=["x"],
+        )
+        diag = dropped.metadata["support_diagnostics"][0]
+        self.assertGreater(diag["n_unsupported_event_rows"], 0)
+        self.assertEqual(
+            dropped.metadata["unsupported_event_policy"], "drop"
+        )
+
+        with self.assertRaises(ValueError):
+            DRLPDID(
+                estimation_method="ra",
+                horizons=(-2, 0),
+                unsupported_event_policy="error",
+            ).fit(
+                df, outcome="y", unit="id", time="time",
+                first_treat="g", covariates=["x"],
+            )
     def test_multiplier_keeps_cluster_robust_pointwise_interval(self):
         df = absorbing_panel()
         kwargs = dict(
@@ -173,6 +206,8 @@ class FormalAPITests(unittest.TestCase):
             post_window=(0, 2),
             post_aggregation="mean_horizons",
             inference="cluster",
+            small_sample_correction="none",
+            rank_deficient_action="silent",
         ).fit(**fit_kwargs)
         # The identity IPT == DR-IPT holds when the common-slope OR basis is
         # nested in the IPT balancing span.
@@ -183,6 +218,8 @@ class FormalAPITests(unittest.TestCase):
             post_aggregation="mean_horizons",
             inference="cluster",
             or_slope_structure="common",
+            small_sample_correction="none",
+            rank_deficient_action="silent",
         ).fit(**fit_kwargs)
         supported = ipt.event_study["horizon"] != -1
         differences = np.abs(

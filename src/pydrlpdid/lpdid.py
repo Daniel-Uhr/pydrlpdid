@@ -1,7 +1,8 @@
 """Benchmark LP-DiD estimator following Dube, Girardi, Jordà & Taylor (2025).
 
-A single :class:`LPDID` class covers all three target estimands and both
-absorbing and non-absorbing treatment settings described in the paper.
+This private computational engine covers all three target estimands and both
+absorbing and non-absorbing treatment settings described in the paper. The
+public estimator is :class:`pydrlpdid.LPDID`.
 
 Target estimands (``target_estimand``)
 ---------------------------------------
@@ -71,6 +72,7 @@ from ._panel_utils import (
 )
 from ._results import LPDIDResults
 from ._errors import ExperimentalFeatureError, InferenceError
+from ._aggregation import horizon_aggregate
 
 
 # ---------------------------------------------------------------------------
@@ -82,14 +84,17 @@ def _nan_row(h: int) -> dict:
         "horizon": int(h), "estimate": np.nan, "se": np.nan,
         "t_stat": np.nan, "p_value": np.nan,
         "ci_lower": np.nan, "ci_upper": np.nan,
+        "n_obs": 0, "n_event_rows": 0, "n_clusters": 0,
     }
 
 
 def _make_row(
-    h: int, est: float, se: float, alpha: float, n_clusters: int
+    h: int, est: float, se: float, alpha: float, n_clusters: int,
+    n_obs: int, n_event_rows: int,
 ) -> dict:
     return {
-        "horizon": int(h), "estimate": est, "se": se,
+        "horizon": int(h), "estimate": est, "se": se, "n_obs": int(n_obs),
+        "n_event_rows": int(n_event_rows),
         **analytic_cluster_inference(est, se, alpha, n_clusters),
     }
 
@@ -108,8 +113,15 @@ def _cluster_fit(model, groups: pd.Series):
         ) from exc
 
 
-def _ctrl_cols(covariates: Optional[List[str]], ldy: bool, n: int) -> List[str]:
+def _ctrl_cols(
+    covariates: Optional[List[str]],
+    ldy: bool,
+    n: int,
+    n_levels: int = 0,
+) -> List[str]:
     cols: List[str] = []
+    if n_levels > 0:
+        cols.extend([f"ly{k}" for k in range(1, int(n_levels) + 1)])
     if ldy and n > 0:
         cols.extend([f"ldy{k}" for k in range(1, int(n) + 1)])
     if covariates:
@@ -124,6 +136,25 @@ def _formula(lhs: str, treat: Optional[str], time: str, controls: List[str]) -> 
     rhs.append(f"C({time})")
     rhs.extend(controls or [])
     return lhs + " ~ " + " + ".join(rhs)
+
+
+def _enforce_absorbed_level_overlap(
+    local: pd.DataFrame, absorb_columns: Optional[List[str]]
+) -> tuple[pd.DataFrame, int]:
+    """Drop RA treated rows whose absorbed level has no clean control."""
+    if not absorb_columns or local.empty:
+        return local, 0
+    out = local
+    n_before = int((out["D_local"] == 1).sum())
+    for column in absorb_columns:
+        control_levels = set(
+            out.loc[out["D_local"].eq(0), column].dropna().tolist()
+        )
+        keep = out["D_local"].eq(0) | (
+            out["D_local"].eq(1) & out[column].isin(control_levels)
+        )
+        out = out.loc[keep].copy()
+    return out, n_before - int((out["D_local"] == 1).sum())
 
 
 # ---------------------------------------------------------------------------
@@ -168,14 +199,33 @@ def _fit_linear(
             if pre_rw is not None else _rw_weights(s, time)
         )
         s = s.loc[np.isfinite(s["_w"]) & (s["_w"] > 0)].copy()
-        model = smf.wls(f, data=s, weights=s["_w"])
     else:
         s["_w"] = 1.0
-        model = smf.ols(f, data=s)
+
+    y_df, x_df = patsy.dmatrices(f, s, return_type="dataframe")
+    y = np.asarray(y_df, dtype=float).reshape(-1)
+    x_full = np.asarray(x_df, dtype=float)
+    keep = _independent_columns(x_full)
+    retained = [str(x_df.columns[j]) for j in keep]
+    if "D_local" not in retained:
+        raise ValueError(
+            "The treatment column is not identified after deterministic "
+            "rank reduction of the LP-DiD design."
+        )
+    x = x_full[:, keep]
+    model = sm.WLS(y, x, weights=s["_w"].to_numpy(dtype=float))
     fit = _cluster_fit(model, s[unit])
-    est = float(fit.params["D_local"])
-    se = float(fit.bse["D_local"]) if "D_local" in fit.bse.index else np.nan
-    return {"estimate": est, "se": se}
+    idx = retained.index("D_local")
+    est = float(fit.params[idx])
+    se = float(fit.bse[idx])
+    return {
+        "estimate": est,
+        "se": se,
+        "retained_columns": retained,
+        "dropped_columns": [
+            str(x_df.columns[j]) for j in range(x_full.shape[1]) if j not in set(keep)
+        ],
+    }
 
 
 def _influence_linear(
@@ -200,10 +250,18 @@ def _influence_linear(
         s, return_type="dataframe",
     )
     y = s["outcome_local"].to_numpy(dtype=float)
-    X = np.asarray(X_df, dtype=float)
+    X_full = np.asarray(X_df, dtype=float)
+    keep = _independent_columns(X_full)
+    retained = [str(X_df.columns[j]) for j in keep]
+    if "D_local" not in retained:
+        raise ValueError(
+            "The treatment column is not identified after deterministic "
+            "rank reduction of the LP-DiD design."
+        )
+    X = X_full[:, keep]
     w = s["_w"].to_numpy(dtype=float)
     theta = np.asarray(sm.WLS(y, X, weights=w).fit().params, dtype=float)
-    idx = list(X_df.columns).index("D_local")
+    idx = retained.index("D_local")
 
     infl = stacked_influence(
         theta,
@@ -223,6 +281,10 @@ def _influence_linear(
         "se": se_from_influence(psi),
         "psi_by_cluster": pd.Series(psi, index=pd.Index(infl["cluster_labels"])),
         "small_sample_factor": float(_cr1),
+        "retained_columns": retained,
+        "dropped_columns": [
+            str(X_df.columns[j]) for j in range(X_full.shape[1]) if j not in set(keep)
+        ],
     }
 
 
@@ -231,15 +293,35 @@ def _influence_linear(
 # ---------------------------------------------------------------------------
 
 def _independent_columns(x: np.ndarray) -> np.ndarray:
-    """Return a deterministic, original-order full-rank column subset."""
-    keep: List[int] = []
+    """Return a deterministic, original-order full-rank column subset.
+
+    Modified Gram--Schmidt with one re-orthogonalization pass avoids the
+    repeated large SVDs of the earlier implementation.  This matters for
+    county panels with tens of thousands of rows and many calendar effects.
+    """
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 2 or x.shape[1] == 0:
+        return np.asarray([], dtype=int)
+    n, p = x.shape
+    column_scale = np.linalg.norm(x, axis=0)
+    reference = float(np.max(column_scale)) if column_scale.size else 0.0
+    tolerance = (
+        np.finfo(float).eps * max(n, p) * max(reference, 1.0) * np.sqrt(p)
+    )
+    q = np.empty((n, min(n, p)), dtype=float)
     rank = 0
-    for j in range(x.shape[1]):
-        candidate = x[:, keep + [j]]
-        new_rank = int(np.linalg.matrix_rank(candidate))
-        if new_rank > rank:
+    keep: List[int] = []
+    for j in range(p):
+        residual = x[:, j].copy()
+        if rank:
+            basis = q[:, :rank]
+            residual -= basis @ (basis.T @ residual)
+            residual -= basis @ (basis.T @ residual)
+        norm = float(np.linalg.norm(residual))
+        if np.isfinite(norm) and norm > tolerance:
+            q[:, rank] = residual / norm
+            rank += 1
             keep.append(j)
-            rank = new_rank
     return np.asarray(keep, dtype=int)
 
 
@@ -363,8 +445,8 @@ def _fit_horizon(
     cluster_universe: pd.Index,
     pre_rw: Optional[pd.Series] = None,
     small_sample_correction: str = "cr1",
-) -> tuple[float, float, pd.Series]:
-    """Estimate ATT-h, SE, and cluster influence for one horizon."""
+) -> tuple[float, float, pd.Series, tuple[str, ...]]:
+    """Estimate ATT-h, SE, cluster influence, and rank diagnostics."""
     zero = pd.Series(0.0, index=cluster_universe)
     if estimand == "ra":
         if compute_influence:
@@ -374,13 +456,17 @@ def _fit_horizon(
             est = infl["estimate"]
             se = infl["se"]
             psi = infl["psi_by_cluster"].reindex(cluster_universe, fill_value=0.0)
+            dropped = tuple(infl["dropped_columns"])
         else:
-            est = _fit_ra(local, unit, time, controls)["estimate"]
+            fit = _fit_ra(local, unit, time, controls)
+            est = fit["estimate"]
             se = np.nan
             psi = zero
+            dropped = tuple(fit["dropped_columns"])
     else:
         r = _fit_linear(local, unit, time, controls, estimand, pre_rw)
         est, se = r["estimate"], r["se"]
+        dropped = tuple(r["dropped_columns"])
         psi = zero
         if compute_influence:
             infl = _influence_linear(
@@ -389,7 +475,7 @@ def _fit_horizon(
             )
             se = infl["se"]
             psi = infl["psi_by_cluster"].reindex(cluster_universe, fill_value=0.0)
-    return est, se, psi
+    return est, se, psi, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +517,7 @@ def _avg_scalar(
 
 def _build_pooled_local(
     df: pd.DataFrame, outcome: str, unit: str, time: str,
-    post_window: int, base_period: BasePeriod,
+    horizons: List[int], kind: str, base_period: BasePeriod,
     clean_control: str, effect_stabilization: Optional[int],
     extra_cols: List[str],
     user_covariates: Optional[List[str]] = None,
@@ -440,83 +526,65 @@ def _build_pooled_local(
     switch_in: str = "sustained",
     control_window: str = "horizon",
 ) -> pd.DataFrame:
-    """Pooled (averaged-outcome) local sample for Section 3.5."""
-    s = df.copy()
-    # Lag user covariates to t-1 before any computation (same logic as
-    # build_local_sample). ldy* controls are already lags — do not re-lag.
-    if lag_covariates and user_covariates:
-        for c in user_covariates:
-            if c in s.columns:
-                s[c] = lag(s, unit, c, 1)
-    post_list = [lead(s, unit, outcome, h) for h in range(0, post_window + 1)]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        s["_pooled_post_mean"] = np.nanmean(np.column_stack(post_list), axis=1)
-    s["outcome_local"] = s["_pooled_post_mean"] - compute_base_series(
-        s, outcome, unit, base_period
+    """Build a pooled pre- or post-window stack on one common sample."""
+    horizons = [int(h) for h in horizons]
+    if not horizons or kind not in {"pre", "post"}:
+        return df.iloc[0:0].copy()
+
+    # Reuse the certified horizon-specific membership rules.  Absorbing
+    # placebo pooling uses entry-date membership (h=0); non-absorbing pooling
+    # must instead use the most negative placebo so its clean-history window
+    # covers the entire reach-back interval.
+    membership_h = (
+        max(horizons)
+        if kind == "post"
+        else (min(horizons) if clean_control in {"first_entry", "stabilized"} else 0)
     )
+    # Membership must not require the outcome at ``membership_h`` unless that
+    # horizon is itself in the requested pooled window.  In particular, a
+    # pooled placebo such as h=-2 uses Y_{t-2} and Y_{t-1}, not Y_t.  A dummy
+    # complete outcome lets the certified membership routine apply only the
+    # treatment/history rules; the actual pooled outcome support is imposed
+    # immediately below.
+    membership_df = df.copy()
+    membership_outcome = "_pooled_membership_outcome"
+    membership_df[membership_outcome] = 0.0
+    local = build_local_sample(
+        membership_df, membership_outcome, unit, time, membership_h, base_period,
+        clean_control, effect_stabilization, extra_cols,
+        user_covariates=user_covariates,
+        lag_covariates=lag_covariates,
+        control_pool=control_pool,
+        switch_in=switch_in,
+        control_window=control_window,
+    )
+    if local.empty:
+        return local
 
-    if clean_control == "never_treated":
-        treat_mask = s["D_treat"] == 1
-        ctrl_mask = s["_never_treated"] == 1
-    elif clean_control == "not_yet_treated":
-        treat_mask = s["D_treat"] == 1
-        ctrl_mask = lead(s, unit, "_treat", post_window).fillna(1.0) == 0
-    elif clean_control == "first_entry":
-        newly = s["D_treat"] == 1
-        first_t = s["_first_treat"] == s[time]
-        stays = lead(s, unit, "_treat", post_window).fillna(0) == 1
-        treat_mask = newly & first_t & stays
-        ctrl_mask = lead(s, unit, "_treat", post_window).fillna(1.0) == 0
-    elif clean_control == "stabilized":
-        _ccs_col = "CCS_0" if control_window == "entry" else f"CCS_{post_window}"
-        stable = s[_ccs_col] == 1
-        # Treated requires a clean pre-window (CCS_0) per eq. (13), matching
-        # build_local_sample and the Stata `tdemoc==1 & CCS_0==1` condition.
-        treat_mask = (s["D_treat"] == 1) & (s["CCS_0"] == 1)
-        ctrl_mask = (s["D_treat"] == 0) & stable
-        if "_treat_obs" in s.columns:
-            lag_treat_t = lag(s, unit, "_treat", 1)
-            lag_obs_t = lag(s, unit, "_treat_obs", 1)
-            treat_mask = (
-                treat_mask & (s["_treat_obs"] == 1)
-                & (lag_treat_t == 0) & (lag_obs_t == 1)
-            )
-            ctrl_mask = ctrl_mask & (s["_treat_obs"] == 1)
-        if control_pool == "untreated_only":
-            lag_treat = lag(s, unit, "_treat", 1)
-            ctrl_mask = ctrl_mask & (s["_treat"] == 0) & (lag_treat == 0)
-            if "_treat_obs" in s.columns:
-                ctrl_mask = ctrl_mask & (lag(s, unit, "_treat_obs", 1) == 1)
-        # Sustained switch-in (eq. 13): treated stays treated through the whole
-        # pooled post window [0, post_window].
-        if switch_in == "sustained":
-            stay_on = pd.Series(True, index=s.index)
-            for j in range(0, post_window + 1):
-                stay_on = stay_on & (lead(s, unit, "_treat", j).fillna(0) == 1)
-                if "_treat_obs" in s.columns:
-                    stay_on = stay_on & (lead(s, unit, "_treat_obs", j).fillna(0) == 1)
-            treat_mask = treat_mask & stay_on
-    else:
-        raise ValueError(f"Invalid clean_control: '{clean_control}'.")
-
-    s = s.loc[treat_mask | ctrl_mask].copy()
-    s["D_local"] = treat_mask.loc[s.index].astype(int)
-    needed = [unit, time, "D_local", "outcome_local"] + list(extra_cols)
-    s = s.dropna(subset=[c for c in needed if c in s.columns]).copy()
-    s = s.loc[np.isfinite(s["outcome_local"])].copy()
-    if s.empty:
-        return s.reset_index(drop=True)
-    # Exact-replication convention: keep treated-only time cells (see
-    # build_local_sample); require only that some control exists overall.
-    if (s["D_local"] == 0).sum() == 0:
-        return s.iloc[0:0].reset_index(drop=True)
-    return s.reset_index(drop=True)
+    targets = np.column_stack([
+        lead(df, unit, outcome, h).to_numpy(dtype=float) for h in horizons
+    ])
+    complete = np.all(np.isfinite(targets), axis=1)
+    pooled_diff = np.full(len(df), np.nan, dtype=float)
+    pooled_diff[complete] = (
+        targets[complete].mean(axis=1)
+        - compute_base_series(df, outcome, unit, base_period)
+          .to_numpy(dtype=float)[complete]
+    )
+    pooled_by_key = pd.Series(
+        pooled_diff,
+        index=pd.MultiIndex.from_frame(df[[unit, time]]),
+    )
+    local_keys = pd.MultiIndex.from_frame(local[[unit, time]])
+    local["outcome_local"] = pooled_by_key.reindex(local_keys).to_numpy(dtype=float)
+    local = local.loc[np.isfinite(local["outcome_local"])].copy()
+    return local.reset_index(drop=True)
 
 
 def _pooled_scalar(
     df: pd.DataFrame, outcome: str, unit: str, time: str,
-    event_df: pd.DataFrame, base_period: BasePeriod,
+    event_df: pd.DataFrame, horizons: List[int], kind: str,
+    base_period: BasePeriod,
     clean_control: str, effect_stabilization: Optional[int],
     controls: List[str], estimand: str, alpha: float, compute_influence: bool,
     user_covariates: Optional[List[str]] = None,
@@ -525,16 +593,18 @@ def _pooled_scalar(
     switch_in: str = "sustained",
     control_window: str = "horizon",
     cluster_universe: Optional[pd.Index] = None,
+    inference_cluster: Optional[str] = None,
     small_sample_correction: str = "cr1",
-) -> tuple[list[dict], Dict[str, pd.Series]]:
-    finite_post = event_df.loc[
-        (event_df["horizon"] >= 0) & np.isfinite(event_df["estimate"]), "horizon"
-    ].tolist()
-    if not finite_post:
-        return [], {}
-    pw = int(max(finite_post))
+    absorb_columns: Optional[List[str]] = None,
+) -> tuple[list[dict], Dict[str, pd.Series], tuple[str, ...]]:
+    horizons = [int(h) for h in horizons]
+    supported = set(
+        event_df.loc[np.isfinite(event_df["estimate"]), "horizon"].astype(int)
+    )
+    if not horizons or not set(horizons).issubset(supported):
+        return [], {}, ()
     pl = _build_pooled_local(
-        df, outcome, unit, time, pw, base_period,
+        df, outcome, unit, time, horizons, kind, base_period,
         clean_control, effect_stabilization, controls,
         user_covariates=user_covariates,
         lag_covariates=lag_covariates,
@@ -543,40 +613,58 @@ def _pooled_scalar(
         control_window=control_window,
     )
     if pl.empty or pl["D_local"].sum() == 0:
-        return [], {}
+        return [], {}, ()
+
+    if estimand == "ra":
+        pl, _ = _enforce_absorbed_level_overlap(pl, absorb_columns)
+        if pl.empty or pl["D_local"].sum() == 0:
+            return [], {}, ()
+
+    cluster_col = inference_cluster or unit
+    term = "ATT pooled" if kind == "post" else "Placebo pooled"
 
     scalar_psi: Dict[str, pd.Series] = {}
     if estimand == "ra":
-        est = _fit_ra(pl, unit, time, controls)["estimate"]
+        fit = _fit_ra(pl, cluster_col, time, controls)
+        est = fit["estimate"]
+        dropped = tuple(fit["dropped_columns"])
         se = np.nan
         if compute_influence:
             infl = _influence_ra(
-                pl, unit, time, controls, small_sample_correction
+                pl, cluster_col, time, controls, small_sample_correction
             )
             est, se = infl["estimate"], infl["se"]
-            scalar_psi["ATT pooled"] = infl["psi_by_cluster"]
+            scalar_psi[term] = infl["psi_by_cluster"]
     else:
-        r = _fit_linear(pl, unit, time, controls, estimand)
+        r = _fit_linear(pl, cluster_col, time, controls, estimand)
         est, se = r["estimate"], r["se"]
+        dropped = tuple(r["dropped_columns"])
         if compute_influence:
             infl = _influence_linear(
-                pl, unit, time, controls, estimand,
+                pl, cluster_col, time, controls, estimand,
                 small_sample_correction=small_sample_correction,
             )
             se = infl["se"]
-            scalar_psi["ATT pooled"] = infl["psi_by_cluster"]
+            scalar_psi[term] = infl["psi_by_cluster"]
 
     if compute_influence and cluster_universe is not None:
-        scalar_psi["ATT pooled"] = scalar_psi["ATT pooled"].reindex(
+        scalar_psi[term] = scalar_psi[term].reindex(
             cluster_universe, fill_value=0.0
         )
 
     return [{
-        "term": "ATT pooled", "estimate": est, "se": se,
+        "term": term, "window": kind, "aggregation": "pooled",
+        "estimate": est, "se": se,
+        "n_obs": int(len(pl)),
+        "n_event_rows": int(pl["D_local"].eq(1).sum()),
+        "n_horizons": int(len(horizons)),
+        "horizons": tuple(horizons),
+        "weights": None,
+        "weight_basis": "joint_pooled_outcome_regression",
         **analytic_cluster_inference(
-            est, se, alpha, int(pl[unit].dropna().nunique())
+            est, se, alpha, int(pl[cluster_col].dropna().nunique())
         ),
-    }], scalar_psi
+    }], scalar_psi, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +672,7 @@ def _pooled_scalar(
 # ---------------------------------------------------------------------------
 
 def _cluster_bootstrap(
-    estimator: "LPDID",
+    estimator: "_LPDIDEngine",
     data: pd.DataFrame, outcome: str, unit: str, time: str,
     first_treat: Optional[str], treatment: Optional[str],
     covariates: Optional[List[str]],
@@ -607,7 +695,14 @@ def _cluster_bootstrap(
         return {"event_study": c["event_study"], "scalars": c["scalars"]}
 
     boot = run_cluster_bootstrap(
-        _refit, data.copy(), unit, estimator.n_bootstrap, estimator.alpha, rng, orig
+        _refit,
+        data.copy(),
+        estimator.cluster or unit,
+        estimator.n_bootstrap,
+        estimator.alpha,
+        rng,
+        orig,
+        panel_unit=unit,
     )
 
     for df_ref, key, on in [
@@ -627,11 +722,11 @@ def _cluster_bootstrap(
 
 
 # ---------------------------------------------------------------------------
-# LPDID — the single public estimator
+# Internal LP-DiD computational engine
 # ---------------------------------------------------------------------------
 
-class LPDID:
-    """LP-DiD estimator: variance-weighted, reweighted, and regression-adjusted.
+class _LPDIDEngine:
+    """Internal LP-DiD computational engine.
 
     Implements all three target estimands from Dube et al. (2025, Sections 3.1
     and 3.3), for both absorbing and non-absorbing treatment settings
@@ -710,17 +805,17 @@ class LPDID:
     --------
     Absorbing treatment — all three estimands:
 
-    >>> from lpdid import LPDID
-    >>> res_vw = LPDID(target_estimand='vw').fit(
+    >>> from pydrlpdid.lpdid import _LPDIDEngine
+    >>> res_vw = _LPDIDEngine(target_estimand='vw').fit(
     ...     df, outcome='y', unit='id', time='t', first_treat='g')
-    >>> res_rw = LPDID(target_estimand='rw').fit(
+    >>> res_rw = _LPDIDEngine(target_estimand='rw').fit(
     ...     df, outcome='y', unit='id', time='t', first_treat='g')
-    >>> res_ra = LPDID(target_estimand='ra', base_period='all_pre').fit(
+    >>> res_ra = _LPDIDEngine(target_estimand='ra', base_period='all_pre').fit(
     ...     df, outcome='y', unit='id', time='t', first_treat='g')
 
     Non-absorbing treatment — first-entry condition (Section 4.2.2):
 
-    >>> res_fe = LPDID(
+    >>> res_fe = _LPDIDEngine(
     ...     target_estimand='vw',
     ...     clean_control='first_entry',
     ...     nonabsorbing=True,
@@ -728,7 +823,7 @@ class LPDID:
 
     Non-absorbing with effect stabilization (Section 4.2.3):
 
-    >>> res_st = LPDID(
+    >>> res_st = _LPDIDEngine(
     ...     target_estimand='rw',
     ...     clean_control='stabilized',
     ...     effect_stabilization=4,
@@ -753,6 +848,7 @@ class LPDID:
         anticipation: int = 0,
         include_lagged_outcome_change: bool = False,
         n_lagged_outcome_changes: int = 0,
+        n_lagged_outcome_levels: int = 0,
         inference: str = "cluster",
         n_bootstrap: int = 499,
         bootstrap_weights: str = "mammen",
@@ -762,12 +858,21 @@ class LPDID:
         max_post: Optional[int] = None,
         lag_covariates: bool = False,
         fixed_composition: bool = False,
+        no_composition: bool = False,
         support_policy: str = "supported_subset",
         left_censoring: str = "error",
         time_policy: str = "calendar",
         history_policy: str = "observed",
         pre_weighting: str = "horizon_specific",
+        cluster: Optional[str] = None,
         small_sample_correction: str = "cr1",
+        rank_deficient_action: str = "warn",
+        pooled_pre_horizons: Optional[List[int]] = None,
+        pooled_post_horizons: Optional[List[int]] = None,
+        pre_aggregations: Optional[List[str]] = None,
+        post_aggregations: Optional[List[str]] = None,
+        omit_overlapping_outcome_controls: bool = True,
+        absorb_columns: Optional[List[str]] = None,
     ) -> None:
         self.target_estimand = str(target_estimand).lower()
         if self.target_estimand not in self._VALID_ESTIMANDS:
@@ -792,6 +897,7 @@ class LPDID:
         self.anticipation = int(max(anticipation, 0))
         self.include_lagged_outcome_change = bool(include_lagged_outcome_change)
         self.n_lagged_outcome_changes = int(max(n_lagged_outcome_changes, 0))
+        self.n_lagged_outcome_levels = int(max(n_lagged_outcome_levels, 0))
         self.inference = str(inference).lower()
         if self.inference not in {"cluster", "multiplier", "cluster_bootstrap"}:
             raise ValueError(
@@ -806,6 +912,11 @@ class LPDID:
         self.max_post = None if max_post is None else int(max_post)
         self.lag_covariates = bool(lag_covariates)
         self.fixed_composition = bool(fixed_composition)
+        self.no_composition = bool(no_composition)
+        if self.fixed_composition and self.no_composition:
+            raise ValueError(
+                "Use fixed_composition or no_composition, not both."
+            )
         # Certified equation (13) design for stabilized non-absorbing treatment.
         self.control_pool = "stabilized_all"
         self.switch_in = "sustained"
@@ -823,11 +934,35 @@ class LPDID:
             raise ValueError(
                 "pre_weighting must be 'post_target' or 'horizon_specific'."
             )
+        self.cluster = cluster
         self.small_sample_correction = str(small_sample_correction).lower()
         if self.small_sample_correction not in {"none", "cr1"}:
             raise ValueError(
                 "small_sample_correction must be 'cr1' or 'none'."
             )
+        self.rank_deficient_action = str(rank_deficient_action).lower()
+        if self.rank_deficient_action not in {"warn", "error", "silent"}:
+            raise ValueError(
+                "rank_deficient_action must be 'warn', 'error', or 'silent'."
+            )
+        self.pooled_pre_horizons = (
+            None if pooled_pre_horizons is None
+            else [int(h) for h in pooled_pre_horizons]
+        )
+        self.pooled_post_horizons = (
+            None if pooled_post_horizons is None
+            else [int(h) for h in pooled_post_horizons]
+        )
+        self.pre_aggregations = (
+            None if pre_aggregations is None else list(pre_aggregations)
+        )
+        self.post_aggregations = (
+            None if post_aggregations is None else list(post_aggregations)
+        )
+        self.omit_overlapping_outcome_controls = bool(
+            omit_overlapping_outcome_controls
+        )
+        self.absorb_columns = list(absorb_columns or [])
 
     # ------------------------------------------------------------------
     def _prepare(self, data, outcome, unit, time, first_treat, treatment, covariates):
@@ -841,6 +976,7 @@ class LPDID:
                 self.n_lagged_outcome_changes
                 if self.include_lagged_outcome_change else 0
             ),
+            n_lagged_outcome_levels=self.n_lagged_outcome_levels,
             left_censoring=self.left_censoring,
             time_policy=self.time_policy,
             history_policy=self.history_policy,
@@ -856,6 +992,7 @@ class LPDID:
         df, covariates = self._prepare(
             data, outcome, unit, time, first_treat, treatment, covariates
         )
+        inference_cluster = self.cluster or unit
         max_pre, max_post = infer_windows(
             df, time, self.base_period, self.max_pre, self.max_post
         )
@@ -867,17 +1004,33 @@ class LPDID:
         controls = _ctrl_cols(
             covariates, self.include_lagged_outcome_change,
             self.n_lagged_outcome_changes,
+            self.n_lagged_outcome_levels,
         )
-        cu = pd.Index(df[unit].dropna().unique())  # cluster universe
+        cu = pd.Index(df[inference_cluster].dropna().unique())
         psi_by_h: Dict[int, pd.Series] = {}
         clusters_by_h: Dict[int, pd.Index] = {}
         rows: list[dict] = []
         omitted_overlapping_outcome_controls: dict[int, tuple[str, ...]] = {}
         control_unit_ids: set = set()
+        rank_dropped_columns: dict[str, tuple[str, ...]] = {}
 
-        # Fixed composition (Section 3.6): hold the unit set across horizons
-        # by fixing control membership at t+H and dropping late treated events.
-        fc_H: Optional[int] = int(max_post) if self.fixed_composition else None
+        # `fixed_composition` is the legacy all-horizon option.
+        # `no_composition` reproduces diff-diff: hold the sample fixed only
+        # across post-treatment horizons and leave placebo leads unrestricted.
+        legacy_fc_H: Optional[int] = (
+            int(max_post) if self.fixed_composition else None
+        )
+
+        complete_post_keys = None
+        if self.no_composition:
+            base_ok = np.isfinite(
+                compute_base_series(df, outcome, unit, self.base_period)
+            )
+            post_ok = pd.Series(True, index=df.index)
+            for j in range(0, int(max_post) + 1):
+                post_ok &= np.isfinite(lead(df, unit, outcome, j))
+            complete = df.loc[base_ok & post_ok, [unit, time]]
+            complete_post_keys = pd.MultiIndex.from_frame(complete)
 
         # Empty-support diagnostic: collect post-treatment horizons whose
         # clean-control stack is exhausted (no clean controls available).
@@ -891,7 +1044,9 @@ class LPDID:
                 self.clean_control, self.effect_stabilization, controls,
                 user_covariates=covariates,
                 lag_covariates=self.lag_covariates,
-                fixed_composition_H=fc_H,
+                fixed_composition_H=(
+                    int(max_post) if self.no_composition else legacy_fc_H
+                ),
                 control_pool=self.control_pool,
                 switch_in=self.switch_in,
                 control_window=self.control_window,
@@ -911,9 +1066,16 @@ class LPDID:
             pre_horizons.remove(self.base_period)
 
         for h in pre_horizons + post_horizons:
-            overlapping = {
-                f"ldy{k}" for k in range(1, -int(h))
-            } if h < -1 else set()
+            fc_H = (
+                int(max_post)
+                if self.no_composition and h >= 0
+                else legacy_fc_H
+            )
+            overlapping = (
+                {f"ldy{k}" for k in range(1, -int(h))}
+                if self.omit_overlapping_outcome_controls and h < -1
+                else set()
+            )
             controls_h = [c for c in controls if c not in overlapping]
             omitted = tuple(sorted(overlapping.intersection(controls)))
             if omitted:
@@ -928,6 +1090,13 @@ class LPDID:
                 switch_in=self.switch_in,
                 control_window=self.control_window,
             )
+            if complete_post_keys is not None and h >= 0 and not local.empty:
+                local_keys = pd.MultiIndex.from_frame(local[[unit, time]])
+                local = local.loc[local_keys.isin(complete_post_keys)].copy()
+            if self.target_estimand == "ra":
+                local, _ = _enforce_absorbed_level_overlap(
+                    local, self.absorb_columns
+                )
             if (
                 local.empty
                 or local["D_local"].sum() == 0
@@ -981,15 +1150,20 @@ class LPDID:
                     )
                     pre_rw = local[time].map(tmap)
 
-            est, se, psi = _fit_horizon(
-                local, unit, time, controls_h, self.target_estimand,
+            est, se, psi, dropped = _fit_horizon(
+                local, inference_cluster, time, controls_h, self.target_estimand,
                 compute_influence, cu, pre_rw=pre_rw,
                 small_sample_correction=self.small_sample_correction,
             )
+            if dropped:
+                rank_dropped_columns[f"h={int(h)}"] = dropped
             psi_by_h[int(h)] = psi
-            clusters_by_h[int(h)] = pd.Index(local[unit].dropna().unique())
+            clusters_by_h[int(h)] = pd.Index(
+                local[inference_cluster].dropna().unique()
+            )
             rows.append(_make_row(
-                h, est, se, self.alpha, len(clusters_by_h[int(h)])
+                h, est, se, self.alpha, len(clusters_by_h[int(h)]), len(local),
+                int(local["D_local"].eq(1).sum()),
             ))
 
         # Normalized base-period row (estimate = 0 by construction)
@@ -998,7 +1172,9 @@ class LPDID:
                 "horizon": int(self.base_period), "estimate": 0.0, "se": np.nan,
                 "t_stat": np.nan, "p_value": np.nan,
                 "ci_lower": np.nan, "ci_upper": np.nan,
-                "df": np.nan, "n_clusters": 0, "critical_value": np.nan,
+                "df": np.nan, "n_obs": np.nan,
+                "n_event_rows": 0,
+                "n_clusters": 0, "critical_value": np.nan,
             })
             psi_by_h[int(self.base_period)] = pd.Series(0.0, index=cu)
             clusters_by_h[int(self.base_period)] = pd.Index([])
@@ -1019,24 +1195,99 @@ class LPDID:
                 stacklevel=2,
             )
 
-        scalar_rows, psi_by_scalar = _avg_scalar(
-            event_df, psi_by_h, clusters_by_h, cu, self.alpha,
-            compute_influence,
+        public_aggregations = (
+            self.pre_aggregations is not None or self.post_aggregations is not None
         )
-        pooled_rows, pooled_psi = _pooled_scalar(
-            df, outcome, unit, time, event_df, self.base_period,
-            self.clean_control, self.effect_stabilization, controls,
-            self.target_estimand, self.alpha, compute_influence,
-            user_covariates=covariates,
-            lag_covariates=self.lag_covariates,
-            control_pool=self.control_pool,
-            switch_in=self.switch_in,
-            control_window=self.control_window,
-            cluster_universe=cu,
-            small_sample_correction=self.small_sample_correction,
+        if public_aggregations:
+            scalar_rows: list[dict] = []
+            psi_by_scalar: Dict[str, pd.Series] = {}
+        else:
+            # Private-engine backward compatibility: retain the historical
+            # horizon mean in addition to the pooled post regression.
+            scalar_rows, psi_by_scalar = _avg_scalar(
+                event_df, psi_by_h, clusters_by_h, cu, self.alpha,
+                compute_influence,
+            )
+        post_pool_h = (
+            post_horizons
+            if self.pooled_post_horizons is None
+            else self.pooled_post_horizons
         )
-        scalar_rows += pooled_rows
-        psi_by_scalar.update(pooled_psi)
+        post_methods = (
+            list(self.post_aggregations)
+            if self.post_aggregations is not None else ["pooled"]
+        )
+        if "pooled" in post_methods:
+            pooled_rows, pooled_psi, pooled_dropped = _pooled_scalar(
+                df, outcome, unit, time, event_df, post_pool_h, "post",
+                self.base_period,
+                self.clean_control, self.effect_stabilization, controls,
+                self.target_estimand, self.alpha, compute_influence,
+                user_covariates=covariates,
+                lag_covariates=self.lag_covariates,
+                control_pool=self.control_pool,
+                switch_in=self.switch_in,
+                control_window=self.control_window,
+                cluster_universe=cu,
+                inference_cluster=inference_cluster,
+                small_sample_correction=self.small_sample_correction,
+                absorb_columns=self.absorb_columns,
+            )
+            if pooled_dropped:
+                rank_dropped_columns["ATT pooled"] = pooled_dropped
+            scalar_rows += pooled_rows
+            psi_by_scalar.update(pooled_psi)
+        for method in post_methods:
+            if method == "pooled":
+                continue
+            row, psi, _ = horizon_aggregate(
+                event_df, psi_by_h, clusters_by_h, cu, post_pool_h,
+                window="post", method=method, alpha=self.alpha,
+                compute_influence=compute_influence,
+            )
+            if row is not None:
+                scalar_rows.append(row)
+                if psi is not None:
+                    psi_by_scalar[str(row["term"])] = psi
+
+        if self.pooled_pre_horizons is not None:
+            pre_methods = (
+                list(self.pre_aggregations)
+                if self.pre_aggregations is not None else ["pooled"]
+            )
+            if "pooled" in pre_methods:
+                pre_rows, pre_psi, pre_dropped = _pooled_scalar(
+                    df, outcome, unit, time, event_df,
+                    self.pooled_pre_horizons, "pre", self.base_period,
+                    self.clean_control, self.effect_stabilization, controls,
+                    self.target_estimand, self.alpha, compute_influence,
+                    user_covariates=covariates,
+                    lag_covariates=self.lag_covariates,
+                    control_pool=self.control_pool,
+                    switch_in=self.switch_in,
+                    control_window=self.control_window,
+                    cluster_universe=cu,
+                    inference_cluster=inference_cluster,
+                    small_sample_correction=self.small_sample_correction,
+                    absorb_columns=self.absorb_columns,
+                )
+                if pre_dropped:
+                    rank_dropped_columns["Placebo pooled"] = pre_dropped
+                scalar_rows += pre_rows
+                psi_by_scalar.update(pre_psi)
+            for method in pre_methods:
+                if method == "pooled":
+                    continue
+                row, psi, _ = horizon_aggregate(
+                    event_df, psi_by_h, clusters_by_h, cu,
+                    self.pooled_pre_horizons,
+                    window="pre", method=method, alpha=self.alpha,
+                    compute_influence=compute_influence,
+                )
+                if row is not None:
+                    scalar_rows.append(row)
+                    if psi is not None:
+                        psi_by_scalar[str(row["term"])] = psi
 
         return {
             "panel": df, "event_study": event_df,
@@ -1050,16 +1301,23 @@ class LPDID:
             "n_cohorts": int(df.loc[df["_first_treat"] > 0, "_first_treat"].nunique()),
             "n_periods": int(df[time].nunique()),
             "fixed_composition": bool(self.fixed_composition),
+            "no_composition": bool(self.no_composition),
             "support_policy": self.support_policy,
             "left_censoring": self.left_censoring,
             "time_policy": self.time_policy,
             "history_policy": self.history_policy,
             "pre_weighting": self.pre_weighting,
             "small_sample_correction": self.small_sample_correction,
+            "rank_dropped_columns": rank_dropped_columns,
             "reference_distribution": "student_t_G_minus_1",
+            "cluster_level": inference_cluster,
             "omitted_overlapping_outcome_controls": (
                 omitted_overlapping_outcome_controls
             ),
+            "omit_overlapping_outcome_controls": bool(
+                self.omit_overlapping_outcome_controls
+            ),
+            "absorb_columns": tuple(self.absorb_columns),
             "nonabsorbing_certified": bool(self.clean_control == "stabilized"),
             "treatment_design": (
                 "recurrent_sustained_switch_in"
@@ -1104,10 +1362,35 @@ class LPDID:
         -------
         LPDIDResults
         """
+        if self.cluster is not None:
+            check_columns(data, [self.cluster])
+            if data[self.cluster].isna().any():
+                raise ValueError("The cluster column contains missing values.")
+            unit_to_cluster = data.groupby(unit, sort=False)[self.cluster].nunique(
+                dropna=False
+            )
+            if (unit_to_cluster != 1).any():
+                raise ValueError(
+                    "Each panel unit must belong to exactly one inference cluster."
+                )
         core = self._fit_core(
             data, outcome, unit, time, first_treat, treatment, covariates,
             compute_influence=(self.inference in {"cluster", "multiplier"}),
         )
+        rank_dropped = core.get("rank_dropped_columns", {})
+        if rank_dropped:
+            detail = "; ".join(
+                f"{term}: {list(columns)}"
+                for term, columns in rank_dropped.items()
+            )
+            message = (
+                "Rank-deficient LP-DiD design detected. Deterministic rank "
+                f"reduction dropped the following columns: {detail}."
+            )
+            if self.rank_deficient_action == "error":
+                raise ValueError(message)
+            if self.rank_deficient_action == "warn":
+                warnings.warn(message, stacklevel=2)
         event_df = core["event_study"].copy()
         scalars = core["scalars"].copy()
 
@@ -1207,7 +1490,7 @@ class LPDID:
             label += " [non-absorbing]"
 
         metadata = {
-            "package_version": "0.8.0rc3",
+            "package_version": "0.8.1",
             "estimator_identity": (
                 "dube_2025_lpdid_ra"
                 if self.target_estimand == "ra"
@@ -1215,6 +1498,7 @@ class LPDID:
             ),
             "estimation_sample": "dube_clean_control_sample",
             "fixed_composition": core.get("fixed_composition", False),
+            "no_composition": core.get("no_composition", False),
             "nonabsorbing_certified": bool(self.clean_control == "stabilized"),
             "treatment_design": core.get("treatment_design"),
             "nonabsorbing_switch_in": "sustained" if self.clean_control == "stabilized" else None,
@@ -1225,6 +1509,8 @@ class LPDID:
             "left_censoring": core.get("left_censoring"),
             "pre_weighting": core.get("pre_weighting"),
             "small_sample_correction": core.get("small_sample_correction"),
+            "rank_deficient_action": self.rank_deficient_action,
+            "rank_dropped_columns": rank_dropped,
             "reference_distribution": core.get("reference_distribution"),
             "omitted_overlapping_outcome_controls": core.get(
                 "omitted_overlapping_outcome_controls", {}

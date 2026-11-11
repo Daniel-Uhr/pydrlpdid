@@ -35,7 +35,7 @@ from scipy import optimize
 from scipy.special import expit
 
 from ._errors import (
-    NuisanceConvergenceError, JacobianError, InferenceError,
+    NuisanceConvergenceError, JacobianError, InferenceError, SupportError,
 )
 
 from ._inference import (
@@ -53,6 +53,7 @@ from ._panel_utils import (
     precompute_ccs,
 )
 from ._results import DRLPDIDResults
+from ._aggregation import horizon_aggregate, normalize_aggregations
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +102,7 @@ class LocalORResult:
 
     params: np.ndarray
     exog: np.ndarray
+    design_info: object
     formula: str
     column_names: Tuple[str, ...]
     dropped_columns: Tuple[str, ...]
@@ -113,12 +115,15 @@ class LocalORResult:
 def _control_columns(
     covariates: Optional[List[str]],
     include_ldy: bool,
-    n_lags: int,
+    n_change_lags: int,
+    n_level_lags: int = 0,
 ) -> List[str]:
     """Collect the list of right-hand-side control column names."""
     cols: List[str] = []
-    if include_ldy and n_lags > 0:
-        cols.extend([f"ldy{k}" for k in range(1, int(n_lags) + 1)])
+    if n_level_lags > 0:
+        cols.extend([f"ly{k}" for k in range(1, int(n_level_lags) + 1)])
+    if include_ldy and n_change_lags > 0:
+        cols.extend([f"ldy{k}" for k in range(1, int(n_change_lags) + 1)])
     if covariates:
         cols.extend(list(covariates))
     return cols
@@ -209,6 +214,86 @@ def _drop_all_treated_time_cells(
     return out.reset_index(drop=True)
 
 
+def _partition_support_samples(
+    local_sample: pd.DataFrame,
+    time: str,
+    *,
+    unsupported_event_policy: str,
+    or_training_support: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Separate the causal target stack from auxiliary OR training rows.
+
+    The target stack contains only reference dates with at least one eligible
+    event and one clean control.  Treated-only dates are therefore outside the
+    nonparametrically supported ATT.  Under the Dube-style outcome-regression
+    convention, clean controls from dates without an event may additionally
+    train the common-slope outcome model, but they never enter the propensity
+    score or the ATT score.
+    """
+    if local_sample.empty:
+        return local_sample.copy(), local_sample.copy(), {
+            "n_requested_event_rows": 0,
+            "n_supported_event_rows": 0,
+            "n_unsupported_event_rows": 0,
+            "n_control_only_dates": 0,
+            "n_auxiliary_or_control_rows": 0,
+            "n_target_rows": 0,
+            "n_or_training_rows": 0,
+        }
+
+    cell = local_sample.groupby(time)["D_local"].agg(["sum", "count"])
+    n_controls = cell["count"] - cell["sum"]
+    mixed_times = cell.index[(cell["sum"] > 0) & (n_controls > 0)]
+    treated_only_times = cell.index[(cell["sum"] > 0) & (n_controls == 0)]
+    control_only_times = cell.index[(cell["sum"] == 0) & (n_controls > 0)]
+
+    unsupported_mask = (
+        local_sample[time].isin(treated_only_times)
+        & local_sample["D_local"].eq(1)
+    )
+    n_unsupported = int(unsupported_mask.sum())
+    if n_unsupported and unsupported_event_policy == "error":
+        raise SupportError(
+            "The requested horizon contains "
+            f"{n_unsupported} treated event(s) on "
+            f"{len(treated_only_times)} reference date(s) without a clean "
+            "control. Use unsupported_event_policy='drop' to estimate the "
+            "supported-event ATT explicitly."
+        )
+
+    target = local_sample.loc[local_sample[time].isin(mixed_times)].copy()
+    target["_target_support"] = True
+
+    if or_training_support == "all_clean_controls":
+        or_training = local_sample.loc[
+            local_sample[time].isin(mixed_times)
+            | (
+                local_sample[time].isin(control_only_times)
+                & local_sample["D_local"].eq(0)
+            )
+        ].copy()
+        or_training["_target_support"] = or_training[time].isin(mixed_times)
+    else:
+        or_training = target.copy()
+
+    diagnostics = {
+        "n_requested_event_rows": int(local_sample["D_local"].eq(1).sum()),
+        "n_supported_event_rows": int(target["D_local"].eq(1).sum()),
+        "n_unsupported_event_rows": n_unsupported,
+        "n_unsupported_event_dates": int(len(treated_only_times)),
+        "n_control_only_dates": int(len(control_only_times)),
+        "n_auxiliary_or_control_rows": int(
+            (
+                or_training["D_local"].eq(0)
+                & ~or_training["_target_support"]
+            ).sum()
+        ),
+        "n_target_rows": int(len(target)),
+        "n_or_training_rows": int(len(or_training)),
+    }
+    return target, or_training, diagnostics
+
+
 
 def _odds_from_prob(
     p: np.ndarray,
@@ -263,9 +348,28 @@ def _overlap_diagnostics(
     }
 
 
+def _sandwich_diagnostics(influence: dict) -> dict:
+    """Return compact, serializable diagnostics for a stacked sandwich."""
+    covariance = np.asarray(influence["covariance"], dtype=float)
+    return {
+        "sandwich_jacobian_rank": int(influence["jacobian_rank"]),
+        "sandwich_jacobian_condition": float(influence["jacobian_condition"]),
+        "sandwich_variance_uncorrected": float(covariance.reshape(-1)[0]),
+        "sandwich_n_scores": int(influence["n_obs"]),
+        "sandwich_n_clusters": int(influence["n_clusters"]),
+    }
+
+
 def _build_exog_from_fit(fit, data: pd.DataFrame) -> np.ndarray:
     """Re-evaluate a patsy design matrix on new data using a fitted model."""
-    if isinstance(fit, (LocalPSResult, LocalORResult)):
+    if isinstance(fit, LocalORResult):
+        if len(fit.exog) == len(data):
+            return np.asarray(fit.exog, dtype=float)
+        rebuilt = patsy.build_design_matrices(
+            [fit.design_info], data, return_type="dataframe"
+        )[0]
+        return np.asarray(rebuilt.loc[:, list(fit.column_names)], dtype=float)
+    if isinstance(fit, LocalPSResult):
         if len(fit.exog) != len(data):
             raise ValueError(
                 "A retained-rank nuisance matrix can only be reused on the "
@@ -375,6 +479,7 @@ def _outcome_design(
     fit = LocalORResult(
         params=np.asarray(beta, dtype=float),
         exog=X,
+        design_info=X_df.design_info,
         formula=formula,
         column_names=retained,
         dropped_columns=dropped,
@@ -647,6 +752,7 @@ def _compute_ra(
     controls: List[str],
     compute_influence: bool,
     or_time_varying_slopes: bool = False,
+    or_training_sample: Optional[pd.DataFrame] = None,
 ) -> dict:
     """Regression-adjustment ATT-h estimator.
 
@@ -667,39 +773,69 @@ def _compute_ra(
     local_sample = local_sample.loc[
         local_sample[time].isin(_hc.loc[_hc > 0].index)
     ].copy()
+    training_sample = (
+        local_sample.copy()
+        if or_training_sample is None else or_training_sample.copy()
+    )
+    if "_target_support" not in training_sample:
+        training_sample["_target_support"] = True
+
     y = np.asarray(local_sample["outcome_local"], dtype=float)
     d = np.asarray(local_sample["D_local"], dtype=float)
-    cluster_ids = local_sample[unit].to_numpy()
-    fit_or, m0_hat = _fit_or_ols_controls(
-        local_sample, time, controls, time_varying_slopes=or_time_varying_slopes
+    fit_or, _ = _fit_or_ols_controls(
+        training_sample, time, controls,
+        time_varying_slopes=or_time_varying_slopes,
     )
     z_all = _build_exog_from_fit(fit_or, local_sample)
     beta_hat = np.asarray(fit_or.params, dtype=float)
+    m0_hat = z_all @ beta_hat
     resid = y - m0_hat
     mu1_hat = float(np.mean(resid[d == 1]))
+
+    y_train = np.asarray(training_sample["outcome_local"], dtype=float)
+    d_train = np.asarray(training_sample["D_local"], dtype=float)
+    target_train = np.asarray(
+        training_sample["_target_support"], dtype=bool
+    ).astype(float)
+    z_train = _build_exog_from_fit(fit_or, training_sample)
+    cluster_ids = training_sample[unit].to_numpy()
 
     n_params = int(len(beta_hat) + 1)
     diagnostics = {
         "or_retained_columns": tuple(fit_or.column_names),
         "or_dropped_columns": tuple(fit_or.dropped_columns),
+        "n_target_rows": int(len(local_sample)),
+        "n_or_training_rows": int(len(training_sample)),
+        "n_auxiliary_or_control_rows": int(
+            (
+                training_sample["D_local"].eq(0)
+                & ~training_sample["_target_support"].astype(bool)
+            ).sum()
+        ),
     }
     if not compute_influence:
         return {
             "estimate": mu1_hat, "se": np.nan,
             "n_moment_parameters": n_params,
-            "n_inference_rows": int(len(local_sample)),
-            "n_inference_clusters": int(local_sample[unit].nunique()),
+            "n_inference_rows": int(len(training_sample)),
+            "n_inference_clusters": int(training_sample[unit].nunique()),
             **diagnostics,
         }
 
     theta_hat = np.concatenate([beta_hat, np.array([mu1_hat])])
 
     def moments_obs(theta):
-        pb = z_all.shape[1]
+        pb = z_train.shape[1]
         beta, mu1 = theta[:pb], theta[pb]
-        resid_theta = y - z_all @ beta
-        m_beta = ((1.0 - d))[:, None] * z_all * resid_theta[:, None]
-        m_mu1 = (d * (resid_theta - mu1))[:, None]
+        resid_theta = y_train - z_train @ beta
+        m_beta = (
+            ((1.0 - d_train))[:, None]
+            * z_train
+            * resid_theta[:, None]
+        )
+        m_mu1 = (
+            target_train * d_train * (resid_theta - mu1)
+        )[:, None]
         return np.column_stack([m_beta, m_mu1])
 
     def target_grad(theta):
@@ -718,8 +854,9 @@ def _compute_ra(
             psi, index=pd.Index(infl["cluster_labels"]), dtype=float
         ),
         "n_moment_parameters": n_params,
-        "n_inference_rows": int(len(local_sample)),
-        "n_inference_clusters": int(local_sample[unit].nunique()),
+        "n_inference_rows": int(len(training_sample)),
+        "n_inference_clusters": int(training_sample[unit].nunique()),
+        **_sandwich_diagnostics(infl),
         **diagnostics,
     }
 
@@ -859,6 +996,7 @@ def _compute_ipw(
         "n_moment_parameters": n_params,
         "n_inference_rows": int(len(local_sample)),
         "n_inference_clusters": int(local_sample[unit].nunique()),
+        **_sandwich_diagnostics(infl),
         **diagnostics,
     }
 
@@ -982,6 +1120,7 @@ def _compute_dr_generic(
         "n_moment_parameters": n_params,
         "n_inference_rows": int(len(local_sample)),
         "n_inference_clusters": int(local_sample[unit].nunique()),
+        **_sandwich_diagnostics(infl),
         **diagnostics,
     }
 
@@ -1186,6 +1325,7 @@ def _compute_dr_improved(
         "n_moment_parameters": n_params,
         "n_inference_rows": int(len(local_sample)),
         "n_inference_clusters": int(local_sample[unit].nunique()),
+        **_sandwich_diagnostics(infl),
         **diagnostics,
     }
 
@@ -1200,43 +1340,57 @@ class DRLPDID:
     ``estimation_method`` selects ``'ra'``, ``'ipw'``, ``'ipt'``,
     ``'dr-ipw'``, or ``'dr-ipt'`` on one common horizon-specific stack.
     ``pre_window`` and ``post_window`` follow the public ``diff-diff`` LP-DiD
-    convention. When omitted, the largest data-supported event-time grid is
-    evaluated. ``horizons=(min_h, max_h)`` remains as a compatibility alias.
+    convention and default to 2 and 0. Passing both as ``None`` evaluates the
+    largest data-supported event-time grid. ``horizons=(min_h, max_h)``
+    remains as an explicit compatibility alias for older notebooks.
     For non-absorbing paths, ``non_absorbing`` is ``'first_entry'`` or
     ``'effect_stabilization'``.
 
-    ``inference='cluster'`` reports analytic unit-cluster-robust inference;
+    ``inference='cluster'`` reports the stacked M-estimation cluster sandwich;
     ``'multiplier'`` additionally reports simultaneous sup-t bands; and
     ``'cluster_bootstrap'`` fully re-estimates paired cluster samples.
     """
 
     def __init__(
         self,
-        *,
         estimation_method: str = "dr-ipt",
-        pre_window: Optional[int] = None,
-        post_window: Optional[Union[int, Tuple[int, int]]] = None,
-        control_group: Optional[str] = None,
+        pre_window: Optional[int] = 2,
+        post_window: Optional[Union[int, Tuple[int, int]]] = 0,
+        control_group: str = "clean",
+        alpha: float = 0.05,
         cluster: Optional[str] = None,
+        rank_deficient_action: str = "warn",
         non_absorbing: Optional[str] = None,
         stabilization_window: Optional[int] = None,
-        design: Optional[str] = None,
-        horizons: Optional[Tuple[int, int]] = None,
-        aggregate_window: Optional[Tuple[int, int]] = None,
-        post_aggregation: Optional[str] = None,
-        outcome_change_lags: int = 0,
-        or_slope_structure: str = "common",
-        history_policy: str = "observed",
-        left_censoring: str = "error",
-        small_sample_correction: str = "cr1",
+        df_convention: str = "cluster",
+        *,
         inference: str = "cluster",
+        small_sample_correction: str = "cr1",
         bootstrap_weights: str = "rademacher",
         n_bootstrap: int = 999,
         min_bootstrap_success: float = 0.90,
-        alpha: float = 0.05,
         seed: Optional[int] = None,
+        or_slope_structure: str = "common",
+        history_policy: str = "diff_diff",
+        left_censoring: str = "keep_as_control_after_L",
+        or_training_support: str = "method_default",
+        unsupported_event_policy: str = "drop",
+        pre_aggregation=None,
+        post_aggregation=None,
+        # Explicit legacy spellings retained for reproducibility of notebooks
+        # created before the literature-standard public surface.
+        design: Optional[str] = None,
+        horizons: Optional[Tuple[int, int]] = None,
+        aggregate_window: Optional[Tuple[int, int]] = None,
+        outcome_change_lags: int = 0,
     ) -> None:
-        """Create a DR-LP-DiD estimator with a diff-diff-compatible surface."""
+        """Create a semiparametric DR-LP-DiD estimator.
+
+        The public design vocabulary follows ``LPDID``. There is deliberately
+        no ``reweight`` flag: every method targets the eligible-entry ATT on
+        the supported semiparametric stack, while ``estimation_method`` selects
+        the nuisance-score construction.
+        """
         methods = {
             "ra": ("ra", None),
             "ipw": ("ipw", "generic"),
@@ -1252,7 +1406,46 @@ class DRLPDID:
             )
         self.estimation_method = em
         self._family, self._ps_method = methods[em]
+        requested_or_support = str(or_training_support).lower()
+        if requested_or_support not in {
+            "method_default", "event_dates", "all_clean_controls"
+        }:
+            raise ValueError(
+                "or_training_support must be 'method_default', "
+                "'event_dates', or 'all_clean_controls'."
+            )
+        if requested_or_support == "method_default":
+            # Dube-style RA learns common slopes from every eligible clean
+            # control. Propensity-based methods remain on the formal local
+            # event-date stack because the PS is undefined on control-only
+            # calendar cells.
+            requested_or_support = (
+                "all_clean_controls" if self._family == "ra" else "event_dates"
+            )
+        if requested_or_support == "all_clean_controls" and self._family != "ra":
+            raise NotImplementedError(
+                "or_training_support='all_clean_controls' is currently "
+                "certified only for estimation_method='ra'. DR-IPW and "
+                "DR-IPT keep both nuisance scores on event dates until the "
+                "auxiliary-OR influence function is separately certified."
+            )
+        self.or_training_support = requested_or_support
+        self.unsupported_event_policy = str(unsupported_event_policy).lower()
+        if self.unsupported_event_policy not in {"drop", "error"}:
+            raise ValueError(
+                "unsupported_event_policy must be 'drop' or 'error'."
+            )
         self.dr_method = self._ps_method
+        if rank_deficient_action not in {"warn", "error", "silent"}:
+            raise ValueError(
+                "rank_deficient_action must be 'warn', 'error', or 'silent'."
+            )
+        if df_convention != "cluster":
+            raise NotImplementedError(
+                "DRLPDID currently certifies df_convention='cluster' only."
+            )
+        self.rank_deficient_action = rank_deficient_action
+        self.df_convention = df_convention
 
         legacy_design = None if design is None else str(design).lower()
         if legacy_design not in {None, "absorbing", "switching"}:
@@ -1276,9 +1469,7 @@ class DRLPDID:
         self.non_absorbing = non_absorbing_mode
         self.design = "switching" if non_absorbing_mode is not None else "absorbing"
 
-        requested_control = (
-            "clean" if control_group is None else str(control_group).lower()
-        )
+        requested_control = str(control_group).lower()
         if self.design == "absorbing":
             aliases = {"clean": "not_yet_treated", "not_yet_treated": "not_yet_treated",
                        "never_treated": "never_treated"}
@@ -1346,8 +1537,9 @@ class DRLPDID:
             raise ValueError(
                 "Use aggregate_window or the legacy tuple-valued post_window, not both."
             )
-        if horizons is not None and (
-            pre_window is not None or (post_window is not None and not isinstance(post_window, tuple))
+        standard_window_defaults = pre_window == 2 and post_window == 0
+        if horizons is not None and not (
+            standard_window_defaults or isinstance(post_window, tuple)
         ):
             raise ValueError(
                 "Use pre_window/post_window or the legacy horizons argument, not both."
@@ -1418,16 +1610,31 @@ class DRLPDID:
         if self.policy_window is not None and post_aggregation is None:
             raise ValueError(
                 "aggregate_window changes the scalar estimand; explicitly set "
-                "post_aggregation='pooled' or 'mean_horizons'."
+                "post_aggregation='pooled', 'equal_horizon', "
+                "'event_weighted', or 'all'."
             )
-        self.post_aggregation = (
-            ("pooled" if self._automatic_aggregates else None)
-            if post_aggregation is None else str(post_aggregation).lower()
+        self.pre_aggregations = normalize_aggregations(
+            pre_aggregation,
+            name="pre_aggregation",
+            default=(("pooled",) if self._automatic_aggregates else ()),
         )
-        if self.post_aggregation not in {None, "pooled", "mean_horizons"}:
-            raise ValueError(
-                "post_aggregation must be 'pooled' or 'mean_horizons'."
+        self.post_aggregations = normalize_aggregations(
+            post_aggregation,
+            name="post_aggregation",
+            default=(("pooled",) if self._automatic_aggregates else ()),
+        )
+        self.pre_aggregation = (
+            self.pre_aggregations[0]
+            if len(self.pre_aggregations) == 1 else (
+                "all" if len(self.pre_aggregations) == 3 else self.pre_aggregations
             )
+        )
+        self.post_aggregation = (
+            self.post_aggregations[0]
+            if len(self.post_aggregations) == 1 else (
+                "all" if len(self.post_aggregations) == 3 else self.post_aggregations
+            )
+        )
         self.small_sample_correction = str(small_sample_correction).lower()
         if self.small_sample_correction not in {"none", "cr1"}:
             raise ValueError("small_sample_correction must be 'none' or 'CR1'.")
@@ -1440,7 +1647,7 @@ class DRLPDID:
             )
         if self.inference == "cluster_bootstrap":
             warnings.warn(
-                "cluster_bootstrap is experimental in pydrlpdid 0.8.0rc3. "
+                "cluster_bootstrap is experimental in pydrlpdid 0.8.1. "
                 "Use at least 999 replications for reported results and "
                 "inspect bootstrap success diagnostics.",
                 UserWarning,
@@ -1488,54 +1695,88 @@ class DRLPDID:
         self.switch_in = "sustained"
         self.control_window = "horizon"
         self.time_policy = "calendar"
+        self.results_ = None
+        self.is_fitted_ = False
+
+    def _resolve_pooled_horizons(self, pooled, *, kind: str):
+        """Resolve diff-diff-style pooled-window requests."""
+        if isinstance(pooled, bool):
+            raise ValueError(
+                f"{kind}_pooled must be None, an int, or a length-2 tuple."
+            )
+        if pooled is None:
+            return None
+        if isinstance(pooled, int):
+            horizons = (
+                list(range(-pooled, -1))
+                if kind == "pre" else list(range(0, pooled + 1))
+            )
+        elif isinstance(pooled, tuple) and len(pooled) == 2:
+            horizons = list(range(int(pooled[0]), int(pooled[1]) + 1))
+        else:
+            raise ValueError(
+                f"{kind}_pooled must be None, an int, or a length-2 tuple."
+            )
+        if kind == "pre":
+            invalid = [h for h in horizons if h >= -1]
+            if self.max_pre is not None:
+                invalid.extend(h for h in horizons if h < -self.max_pre)
+        else:
+            invalid = [h for h in horizons if h < 0]
+            if self.max_post is not None:
+                invalid.extend(h for h in horizons if h > self.max_post)
+        invalid = sorted(set(invalid))
+        if invalid:
+            raise ValueError(
+                f"Requested pooled {kind} horizons {invalid} fall outside "
+                "the event-study window."
+            )
+        return horizons
 
     # ------------------------------------------------------------------
     # Dispatch to semiparametric estimator
     # ------------------------------------------------------------------
 
-    def _fit_pooled_post(
-        self, df, outcome, unit, time, lo, hi,
+    def _fit_pooled_window(
+        self, df, outcome, unit, time, horizons, kind,
         stack_controls, stack_user_covariates, ps_controls, or_controls,
-        compute_influence,
+        compute_influence, inference_cluster=None,
     ):
-        """Pooled post-window ATT on one common sample (Dube et al. 2025, sec. 3.5).
+        """Estimate a pooled pre/post scalar on one complete common stack."""
+        from .lpdid import _build_pooled_local
 
-        The sample and the treated/control masks are those of the horizon hi
-        (diff-diff convention: control window max(horizons)); the outcome is the
-        average long difference over h in [lo, hi], with the baseline at t-1. Rows
-        missing any horizon are dropped, as in diff-diff's pooled builder.
-        """
-        hs = list(range(int(lo), int(hi) + 1))
-        local = build_local_sample(
-            df, outcome, unit, time, int(hi), self.base_period,
+        hs = [int(h) for h in horizons]
+        local = _build_pooled_local(
+            df, outcome, unit, time, hs, kind, self.base_period,
             self.clean_control, self.effect_stabilization, stack_controls,
             user_covariates=stack_user_covariates,
             lag_covariates=self.lag_covariates,
-            fixed_composition_H=None,
             control_pool=self.control_pool,
             switch_in=self.switch_in,
             control_window=self.control_window,
         )
         if local.empty:
             return None
-        series = df.drop_duplicates([unit, time]).set_index([unit, time])[outcome]
-        uu = local[unit].to_numpy()
-        tt = local[time].to_numpy()
-        base = series.reindex(pd.MultiIndex.from_arrays([uu, tt - 1])).to_numpy(dtype=float)
-        longdiffs = np.column_stack([
-            series.reindex(pd.MultiIndex.from_arrays([uu, tt + h])).to_numpy(dtype=float) - base
-            for h in hs
-        ])
-        pooled = longdiffs.mean(axis=1)  # NaN if any horizon is missing
-        keep = np.isfinite(pooled)
-        local = local.loc[keep].copy()
-        local["outcome_local"] = pooled[keep]
-        cell = local.groupby(time)["D_local"].agg(["sum", "count"])
-        supported = cell.index[(cell["sum"] > 0) & (cell["sum"] < cell["count"])]
-        local = local.loc[local[time].isin(supported)].copy()
+        local, or_training, support_diagnostics = _partition_support_samples(
+            local,
+            time,
+            unsupported_event_policy=self.unsupported_event_policy,
+            or_training_support=self.or_training_support,
+        )
         if local.empty or local["D_local"].sum() == 0 or (local["D_local"] == 0).sum() == 0:
             return None
-        return self._fit_one(local, unit, time, ps_controls, or_controls, compute_influence)
+        result = self._fit_one(
+            local,
+            inference_cluster or unit,
+            time,
+            ps_controls,
+            or_controls,
+            compute_influence,
+            or_training_sample=or_training,
+        )
+        result["n_event_rows"] = int(local["D_local"].eq(1).sum())
+        result.update(support_diagnostics)
+        return result
 
     def _fit_one(
         self,
@@ -1545,12 +1786,14 @@ class DRLPDID:
         ps_controls: List[str],
         or_controls: List[str],
         compute_influence: bool,
+        or_training_sample: Optional[pd.DataFrame] = None,
     ) -> dict:
         """Dispatch to the appropriate semiparametric estimator."""
         if self._family == "ra":
             result = _compute_ra(
                 local_sample, unit, time, or_controls, compute_influence,
                 or_time_varying_slopes=self.or_time_varying_slopes,
+                or_training_sample=or_training_sample,
             )
         elif self._family == "ipw":
             result = _compute_ipw(
@@ -1597,34 +1840,13 @@ class DRLPDID:
             and self.small_sample_correction == "cr1"
             and "psi_by_cluster" in result
         ):
-            # Use one common full-DR reference dimension across the five
-            # estimators.  Method-specific moment counts would make nested
-            # IPT and DR-IPT receive different finite-sample corrections even
-            # when their influence functions are algebraically identical.
-            ps_formula = _build_formula(
-                "D_local", time, ps_controls,
-                add_time_fe=self.ps_with_time_fe,
-                time_varying_slopes=self.ps_time_varying_slopes,
-            )
-            _, ps_design = patsy.dmatrices(
-                ps_formula, local_sample, return_type="dataframe"
-            )
-            or_formula = _build_formula(
-                "outcome_local", time, or_controls,
-                add_time_fe=True,
-                time_varying_slopes=self.or_time_varying_slopes,
-            )
-            _, or_design = patsy.dmatrices(
-                or_formula, local_sample, return_type="dataframe"
-            )
-            control = local_sample["D_local"].to_numpy(dtype=float) == 0
-            k_reference = int(
-                1
-                + np.linalg.matrix_rank(np.asarray(ps_design, dtype=float))
-                + np.linalg.matrix_rank(
-                    np.asarray(or_design, dtype=float)[control]
-                )
-            )
+            # CR1 follows the same cluster-sandwich convention used by the
+            # benchmark LPDID engine: G/(G-1) times (n-1)/(n-K), with K equal
+            # to the effective dimension of the moment system actually fitted.
+            # The previous common full-DR reference dimension was convenient
+            # for cross-method numerical identities but was not the method's
+            # own finite-sample sandwich correction.
+            k_reference = int(result["n_moment_parameters"])
             n = int(result["n_inference_rows"])
             g = int(result["n_inference_clusters"])
             if g <= 1 or n <= k_reference:
@@ -1639,8 +1861,9 @@ class DRLPDID:
             ))
             result["psi_by_cluster"] = factor * result["psi_by_cluster"]
             result["se"] = se_from_influence(result["psi_by_cluster"].to_numpy())
-            result["cr1_reference_parameters"] = k_reference
+            result["cr1_parameters"] = k_reference
         result["small_sample_factor"] = factor
+        result["covariance_estimator"] = "cluster_sandwich"
         return result
 
     # ------------------------------------------------------------------
@@ -1660,7 +1883,19 @@ class DRLPDID:
         *,
         _ps_covariates: Optional[List[str]] = None,
         _or_covariates: Optional[List[str]] = None,
+        _n_lagged_outcome_changes: Optional[int] = None,
+        _n_lagged_outcome_levels: int = 0,
+        _absorbed_columns: Optional[List[str]] = None,
+        _pooled_pre_horizons: Optional[List[int]] = None,
+        _pooled_post_horizons: Optional[List[int]] = None,
     ) -> dict:
+        n_change_lags = (
+            self.n_lagged_outcome_changes
+            if _n_lagged_outcome_changes is None
+            else int(_n_lagged_outcome_changes)
+        )
+        n_level_lags = int(_n_lagged_outcome_levels)
+        include_change_lags = n_change_lags > 0
         base_covariates = list(covariates or [])
         ps_base_covariates = (
             base_covariates
@@ -1681,14 +1916,16 @@ class DRLPDID:
             data, outcome, unit, time, first_treat, treatment,
             nonabsorbing=(self.non_absorbing is not None),
             n_lagged_outcome_changes=(
-                self.n_lagged_outcome_changes
-                if self.include_lagged_outcome_change
+                n_change_lags
+                if include_change_lags
                 else 0
             ),
+            n_lagged_outcome_levels=n_level_lags,
             left_censoring=self.left_censoring,
             time_policy=self.time_policy,
             history_policy=self.history_policy,
         )
+        inference_cluster = self.cluster or unit
         data_max_pre, data_max_post = infer_windows(
             df, time, self.base_period, None, None
         )
@@ -1704,22 +1941,25 @@ class DRLPDID:
 
         ps_controls = _control_columns(
             ps_base_covariates,
-            self.include_lagged_outcome_change,
-            self.n_lagged_outcome_changes,
+            include_change_lags,
+            n_change_lags,
+            n_level_lags,
         )
         or_controls = _control_columns(
             or_base_covariates,
-            self.include_lagged_outcome_change,
-            self.n_lagged_outcome_changes,
+            include_change_lags,
+            n_change_lags,
+            n_level_lags,
         )
         stack_controls = list(dict.fromkeys(ps_controls + or_controls))
         stack_user_covariates = all_base_covariates
-        cluster_universe = pd.Index(df[unit].dropna().unique())
+        cluster_universe = pd.Index(df[inference_cluster].dropna().unique())
         psi_by_h: Dict[int, pd.Series] = {}
         clusters_by_h: Dict[int, pd.Index] = {}
         rows: list[dict] = []
         unsupported_horizons: dict[int, str] = {}
         nuisance_diagnostics: dict[int, dict] = {}
+        support_diagnostics_by_h: dict[int, dict] = {}
         control_unit_ids: set = set()
         omitted_overlapping_outcome_controls: dict[int, tuple[str, ...]] = {}
 
@@ -1734,12 +1974,22 @@ class DRLPDID:
 
         for h in pre_horizons + post_horizons:
             # For a placebo lead h<-1, outcome_local = Y_{t+h}-Y_{t-1}.
-            # Generated changes ldy1,...,ldy(-h-1) are algebraic components
-            # of that dependent variable. Conditioning on them would make the
-            # placebo mechanically (rather than scientifically) predictable.
-            overlapping = {
-                f"ldy{k}" for k in range(1, -int(h))
-            } if h < -1 else set()
+            # Generated changes ldy1,...,ldy(-h-1), and the target-period
+            # level ly(-h), are algebraic components of that dependent
+            # variable. Conditioning on them can make the placebo mechanically
+            # rather than scientifically predictable.
+            # RA is the Dube/diff-diff benchmark inside DRLPDID and therefore
+            # retains the same lag basis, including a mechanically fitted
+            # placebo when a lagged outcome change spans the placebo outcome.
+            # Propensity and doubly robust methods keep the stricter native
+            # convention: algebraic components of a placebo outcome are
+            # omitted and reported rather than interpreted as pre-trend
+            # evidence.
+            overlapping = (
+                {f"ldy{k}" for k in range(1, -int(h))}
+                | {f"ly{-int(h)}"}
+                if h < -1 and self._family != "ra" else set()
+            )
             ps_controls_h = [c for c in ps_controls if c not in overlapping]
             or_controls_h = [c for c in or_controls if c not in overlapping]
             stack_controls_h = list(dict.fromkeys(ps_controls_h + or_controls_h))
@@ -1756,26 +2006,13 @@ class DRLPDID:
                 switch_in=self.switch_in,
                 control_window=self.control_window,
             )
-            if (
-                local.empty
-                or local["D_local"].sum() == 0
-                or (local["D_local"] == 0).sum() == 0
-            ):
-                unsupported_horizons[int(h)] = "empty_or_one_sided_local_stack"
-                rows.append(_nan_row(h))
-                psi_by_h[int(h)] = pd.Series(0.0, index=cluster_universe)
-                clusters_by_h[int(h)] = pd.Index([])
-                continue
-
-            # The formal horizon target is defined on supported reference
-            # dates: each retained date contains at least one eligible event
-            # and one eligible clean control. This same stack is used by all
-            # five estimators, including RA.
-            cell = local.groupby(time)["D_local"].agg(["sum", "count"])
-            supported_times = cell.index[
-                (cell["sum"] > 0) & (cell["sum"] < cell["count"])
-            ]
-            local = local.loc[local[time].isin(supported_times)].copy()
+            local, or_training, support_diagnostics = _partition_support_samples(
+                local,
+                time,
+                unsupported_event_policy=self.unsupported_event_policy,
+                or_training_support=self.or_training_support,
+            )
+            support_diagnostics_by_h[int(h)] = support_diagnostics
             if (
                 local.empty
                 or local["D_local"].sum() == 0
@@ -1806,10 +2043,13 @@ class DRLPDID:
                         (control_mask & (local["_treat"] == 1)).sum()
                     ),
                 })
+            counts.update(support_diagnostics)
             try:
                 fit = self._fit_one(
-                    local, unit, time, ps_controls_h, or_controls_h,
-                    compute_influence
+                    local, inference_cluster, time,
+                    ps_controls_h, or_controls_h,
+                    compute_influence,
+                    or_training_sample=or_training,
                 )
             except IPTConvergenceError as exc:
                 raise IPTConvergenceError(
@@ -1831,18 +2071,24 @@ class DRLPDID:
                     or key.startswith("or_")
                     or key.startswith("propensity_")
                     or key.startswith("control_odds_")
+                    or key.startswith("sandwich_")
                     or key in {
                         "control_weight_ess", "small_sample_factor",
-                        "cr1_reference_parameters",
+                        "cr1_parameters", "covariance_estimator",
                         "n_moment_parameters", "n_inference_rows",
                         "n_inference_clusters",
                     }
                 )
             }
             local_psi = fit.get(
-                "psi_by_cluster", pd.Series(0.0, index=pd.Index(local[unit].unique()))
+                "psi_by_cluster",
+                pd.Series(
+                    0.0, index=pd.Index(or_training[inference_cluster].unique())
+                ),
             )
-            clusters_by_h[int(h)] = pd.Index(local[unit].dropna().unique())
+            clusters_by_h[int(h)] = pd.Index(
+                or_training[inference_cluster].dropna().unique()
+            )
             psi_by_h[int(h)] = local_psi.reindex(
                 cluster_universe, fill_value=0.0
             )
@@ -1887,61 +2133,147 @@ class DRLPDID:
         psi_by_scalar: Dict[str, pd.Series] = {}
         scalar_missing_horizons: list[int] = []
 
-        def _cluster_union_size(horizons_for_scalar) -> int:
-            labels = set()
-            for horizon in horizons_for_scalar:
-                labels.update(clusters_by_h.get(int(horizon), pd.Index([])).tolist())
-            return int(len(labels))
-
         effective_policy_window = self.policy_window
         if self._automatic_aggregates and effective_policy_window is None:
             effective_policy_window = (0, max_post)
 
-        if self._automatic_aggregates:
-            requested_pre = list(range(-max_pre, -1))
+        resolved_pre_aggregations = list(self.pre_aggregations)
+        if _pooled_pre_horizons is not None and not resolved_pre_aggregations:
+            resolved_pre_aggregations = ["pooled"]
+        if resolved_pre_aggregations:
+            requested_pre = (
+                list(range(-max_pre, -1))
+                if _pooled_pre_horizons is None
+                else [int(h) for h in _pooled_pre_horizons]
+            )
             by_h = event_df.set_index("horizon")
-            supported_pre = [
+            unsupported_pre = [
                 h for h in requested_pre
-                if h in by_h.index and np.isfinite(by_h.loc[h, "estimate"])
+                if h not in by_h.index or not np.isfinite(by_h.loc[h, "estimate"])
             ]
-            if supported_pre:
-                weights_pre = np.full(len(supported_pre), 1.0 / len(supported_pre))
-                estimates_pre = by_h.loc[supported_pre, "estimate"].to_numpy(dtype=float)
-                estimate_pre = float(np.dot(weights_pre, estimates_pre))
-                se_pre = np.nan
-                if compute_influence:
-                    influence_pre = np.column_stack([
-                        psi_by_h[h].reindex(
-                            cluster_universe, fill_value=0.0
-                        ).to_numpy(dtype=float)
-                        for h in supported_pre
-                    ]) @ weights_pre
-                    se_pre = se_from_influence(influence_pre)
-                    psi_by_scalar["pre"] = pd.Series(
-                        influence_pre, index=cluster_universe, dtype=float
-                    )
-                inference_pre = analytic_cluster_inference(
-                    estimate_pre, se_pre, self.alpha,
-                    _cluster_union_size(supported_pre),
+            if requested_pre and not unsupported_pre and "pooled" in resolved_pre_aggregations:
+                pooled_overlap = (
+                    set().union(*(
+                        (
+                            {f"ldy{k}" for k in range(1, -int(h))}
+                            | {f"ly{-int(h)}"}
+                        )
+                        for h in requested_pre if h < -1
+                    ))
+                    if any(h < -1 for h in requested_pre)
+                    and self._family != "ra"
+                    else set()
                 )
-                scalar_specs["pre"] = (supported_pre, weights_pre)
-                scalar_rows.append({
-                    "term": "pre", "window": "pre",
-                    "aggregation": "mean_horizons",
-                    "estimate": estimate_pre, "se": se_pre,
-                    **inference_pre,
-                    "n_horizons": len(supported_pre),
-                    "horizons": tuple(supported_pre),
-                })
+                pooled_ps_controls = [
+                    control for control in ps_controls
+                    if control not in pooled_overlap
+                ]
+                pooled_or_controls = [
+                    control for control in or_controls
+                    if control not in pooled_overlap
+                ]
+                pooled_stack_controls = list(dict.fromkeys(
+                    pooled_ps_controls + pooled_or_controls
+                ))
+                fit_pre = self._fit_pooled_window(
+                    df, outcome, unit, time, requested_pre, "pre",
+                    pooled_stack_controls, stack_user_covariates,
+                    pooled_ps_controls, pooled_or_controls,
+                    compute_influence, inference_cluster=inference_cluster,
+                )
+                estimate_pre = (
+                    float(fit_pre["estimate"]) if fit_pre is not None else np.nan
+                )
+                se_pre = (
+                    float(fit_pre["se"])
+                    if fit_pre is not None and compute_influence else np.nan
+                )
+                term_pre = "pre [pooled]"
+                if compute_influence and fit_pre is not None:
+                    psi_by_scalar[term_pre] = fit_pre[
+                        "psi_by_cluster"
+                    ].reindex(cluster_universe, fill_value=0.0)
+                if np.isfinite(estimate_pre):
+                    inference_pre = analytic_cluster_inference(
+                        estimate_pre, se_pre, self.alpha,
+                        int(fit_pre.get("n_inference_clusters", 0)),
+                    )
+                    scalar_specs[term_pre] = (requested_pre, "pooled")
+                    scalar_rows.append({
+                        "term": term_pre, "window": "pre",
+                        "aggregation": "pooled",
+                        "estimate": estimate_pre, "se": se_pre,
+                        **inference_pre,
+                        "n_horizons": len(requested_pre),
+                        "horizons": tuple(requested_pre),
+                        "weights": None,
+                        "weight_basis": "joint_pooled_outcome_regression",
+                        "n_event_rows": int(fit_pre.get("n_event_rows", 0)),
+                    })
+            elif unsupported_pre and "pooled" in resolved_pre_aggregations:
+                warnings.warn(
+                    "The pooled pre-treatment placebo was not estimated "
+                    "because these requested horizons are unsupported: "
+                    f"{unsupported_pre}.",
+                    stacklevel=2,
+                )
+            for method in resolved_pre_aggregations:
+                if method == "pooled":
+                    continue
+                row, psi, missing = horizon_aggregate(
+                    event_df, psi_by_h, clusters_by_h, cluster_universe,
+                    requested_pre, window="pre", method=method,
+                    alpha=self.alpha, compute_influence=compute_influence,
+                )
+                if row is None:
+                    if missing:
+                        warnings.warn(
+                            f"The pre-treatment {method} summary was not "
+                            f"estimated because horizons {missing} are unsupported.",
+                            stacklevel=2,
+                        )
+                    continue
+                scalar_rows.append(row)
+                scalar_specs[str(row["term"])] = (
+                    requested_pre, tuple(row["weights"])
+                )
+                if psi is not None:
+                    psi_by_scalar[str(row["term"])] = psi
 
-        if effective_policy_window is not None and self.post_aggregation == "pooled":
+        requested_post_override = (
+            None if _pooled_post_horizons is None
+            else [int(h) for h in _pooled_post_horizons]
+        )
+        resolved_post_aggregations = list(self.post_aggregations)
+        if requested_post_override is not None and not resolved_post_aggregations:
+            resolved_post_aggregations = ["pooled"]
+        if requested_post_override is not None:
+            effective_policy_window = (
+                (min(requested_post_override), max(requested_post_override))
+                if requested_post_override else None
+            )
+
+        requested: list[int] = []
+        if effective_policy_window is not None:
             lo, hi = effective_policy_window
-            requested = list(range(lo, hi + 1))
-            term = "post" if self._automatic_aggregates else f"ATT pooled [{lo},{hi}]"
-            fit_p = self._fit_pooled_post(
-                df, outcome, unit, time, lo, hi,
+            requested = (
+                requested_post_override
+                if requested_post_override is not None
+                else list(range(lo, hi + 1))
+            )
+        if (
+            effective_policy_window is not None
+            and "pooled" in resolved_post_aggregations
+        ):
+            lo, hi = effective_policy_window
+            term = (
+                "post [pooled]" if self._automatic_aggregates
+                else f"ATT pooled [{lo},{hi}]"
+            )
+            fit_p = self._fit_pooled_window(
+                df, outcome, unit, time, requested, "post",
                 stack_controls, stack_user_covariates, ps_controls, or_controls,
-                compute_influence,
+                compute_influence, inference_cluster=inference_cluster,
             )
             est_p = float(fit_p["estimate"]) if fit_p is not None else np.nan
             if not np.isfinite(est_p):
@@ -1971,60 +2303,66 @@ class DRLPDID:
                     **inference_p,
                     "n_horizons": len(requested),
                     "horizons": tuple(requested),
+                    "weights": None,
+                    "weight_basis": "joint_pooled_outcome_regression",
+                    "n_event_rows": int(fit_p.get("n_event_rows", 0)),
                 })
-        elif effective_policy_window is not None:
+        if effective_policy_window is not None:
             lo, hi = effective_policy_window
-            requested = list(range(lo, hi + 1))
-            by_h = event_df.set_index("horizon")
-            scalar_missing_horizons = [
-                h for h in requested
-                if h not in by_h.index or not np.isfinite(by_h.loc[h, "estimate"])
-            ]
-            if scalar_missing_horizons:
-                warnings.warn(
-                    "The prespecified post-window scalar was not estimated "
-                    "because these requested horizons are unsupported: "
-                    f"{scalar_missing_horizons}.",
-                    stacklevel=2,
+            for method in resolved_post_aggregations:
+                if method == "pooled":
+                    continue
+                row, psi, missing = horizon_aggregate(
+                    event_df, psi_by_h, clusters_by_h, cluster_universe,
+                    requested, window="post", method=method,
+                    alpha=self.alpha, compute_influence=compute_influence,
                 )
-            else:
-                weights = np.full(len(requested), 1.0 / len(requested))
-                term = (
-                    "post" if self._automatic_aggregates
-                    else f"ATT policy-window [{lo},{hi}]"
-                )
-                scalar_specs[term] = (requested, weights)
-                estimates = by_h.loc[requested, "estimate"].to_numpy(dtype=float)
-                estimate = float(np.dot(weights, estimates))
-                se = np.nan
-                if compute_influence:
-                    influence = np.column_stack([
-                        psi_by_h[h].reindex(
-                            cluster_universe, fill_value=0.0
-                        ).to_numpy(dtype=float)
-                        for h in requested
-                    ]) @ weights
-                    se = se_from_influence(influence)
-                    psi_by_scalar[term] = pd.Series(
-                        influence, index=cluster_universe, dtype=float
+                if row is None:
+                    scalar_missing_horizons.extend(missing)
+                    if missing:
+                        warnings.warn(
+                            f"The post-treatment {method} ATT was not estimated "
+                            f"because horizons {missing} are unsupported.",
+                            stacklevel=2,
+                        )
+                    continue
+                if not self._automatic_aggregates:
+                    row["term"] = (
+                        f"ATT policy-window [{lo},{hi}] [{method}]"
                     )
-                inference_post = analytic_cluster_inference(
-                    estimate, se, self.alpha,
-                    _cluster_union_size(requested),
+                scalar_rows.append(row)
+                scalar_specs[str(row["term"])] = (
+                    requested, tuple(row["weights"])
                 )
-                scalar_rows.append({
-                    "term": term,
-                    "window": "post",
-                    "aggregation": "mean_horizons",
-                    "estimate": estimate,
-                    "se": se,
-                    **inference_post,
-                    "n_horizons": len(requested),
-                    "horizons": tuple(requested),
-                })
+                if psi is not None:
+                    psi_by_scalar[str(row["term"])] = psi
+        scalar_missing_horizons = sorted(set(scalar_missing_horizons))
+
+        rank_dropped_columns: dict[int, tuple[str, ...]] = {}
+        for horizon, diagnostics in nuisance_diagnostics.items():
+            dropped = sorted(set(
+                diagnostics.get("ps_dropped_columns", ())
+                + diagnostics.get("ipt_dropped_columns", ())
+                + diagnostics.get("or_dropped_columns", ())
+            ))
+            if dropped:
+                rank_dropped_columns[int(horizon)] = tuple(dropped)
+        if rank_dropped_columns:
+            detail = "; ".join(
+                f"h={h}: {list(columns)}"
+                for h, columns in sorted(rank_dropped_columns.items())
+            )
+            message = (
+                "Rank-deficient DRLPDID nuisance design detected. "
+                "Deterministic rank reduction dropped: " + detail + "."
+            )
+            if self.rank_deficient_action == "error":
+                raise ValueError(message)
+            if self.rank_deficient_action == "warn":
+                warnings.warn(message, UserWarning, stacklevel=2)
 
         metadata: dict = {
-            "package_version": "0.8.0rc3",
+            "package_version": "0.8.1",
             "estimator_identity": f"drlpdid_{self.estimation_method}",
             "estimator_label": (
                 "RA"
@@ -2049,16 +2387,41 @@ class DRLPDID:
             "post_window": max_post,
             "base_period": -1,
             "aggregate_window": effective_policy_window,
+            "pre_pooled_horizons": tuple(
+                list(range(-max_pre, -1))
+                if _pooled_pre_horizons is None else _pooled_pre_horizons
+            ),
+            "post_pooled_horizons": tuple(
+                list(range(effective_policy_window[0], effective_policy_window[1] + 1))
+                if requested_post_override is None and effective_policy_window is not None
+                else (requested_post_override or [])
+            ),
+            "pre_aggregation": self.pre_aggregation,
             "post_aggregation": self.post_aggregation,
+            "pre_aggregations": tuple(resolved_pre_aggregations),
+            "post_aggregations": tuple(resolved_post_aggregations),
+            "primary_post_aggregation": (
+                resolved_post_aggregations[0]
+                if resolved_post_aggregations else None
+            ),
+            "aggregation_inference": "conditional_on_realized_design",
             "post_window_missing_horizons": scalar_missing_horizons,
             "support": "reference_dates_with_events_and_clean_controls",
+            "target_support": "event_dates_with_clean_controls",
+            "or_training_support": self.or_training_support,
+            "unsupported_event_policy": self.unsupported_event_policy,
+            "support_diagnostics": support_diagnostics_by_h,
             "composition": "as_observed",
-            "cluster_level": self.cluster or "panel_unit",
+            "cluster_level": inference_cluster,
+            "df_convention": self.df_convention,
             "inference": self.inference,
+            "covariance_estimator": "cluster_sandwich",
             "small_sample_correction": self.small_sample_correction,
             "reference_distribution": "student_t_G_minus_1",
             "or_slope_structure": self.or_slope_structure,
-            "outcome_change_lags": self.n_lagged_outcome_changes,
+            "outcome_change_lags": n_change_lags,
+            "outcome_level_lags": n_level_lags,
+            "absorb": tuple(_absorbed_columns or []),
             "history_policy": self.history_policy,
             "left_censoring": self.left_censoring,
             "multiplier_weights": (
@@ -2072,6 +2435,8 @@ class DRLPDID:
             "ps_covariates": ps_base_covariates,
             "or_covariates": or_base_covariates,
             "unsupported_horizons": unsupported_horizons,
+            "rank_deficient_action": self.rank_deficient_action,
+            "rank_dropped_columns": rank_dropped_columns,
             "nuisance_diagnostics": nuisance_diagnostics,
             "omitted_overlapping_outcome_controls": (
                 omitted_overlapping_outcome_controls
@@ -2104,9 +2469,18 @@ class DRLPDID:
         outcome: str,
         unit: str,
         time: str,
-        first_treat: Optional[str] = None,
         treatment: Optional[str] = None,
         covariates: Optional[List[str]] = None,
+        ylags: int = 0,
+        dylags: int = 0,
+        absorb: Optional[List[str]] = None,
+        post_pooled=None,
+        pre_pooled=None,
+        only_event: bool = False,
+        only_pooled: bool = False,
+        survey_design=None,
+        *,
+        first_treat: Optional[str] = None,
         ps_covariates: Optional[List[str]] = None,
         or_covariates: Optional[List[str]] = None,
     ) -> DRLPDIDResults:
@@ -2122,12 +2496,28 @@ class DRLPDID:
             Unit identifier column name.
         time : str
             Time identifier column name.
-        first_treat : str, optional
-            First-treatment period column (0 for never-treated).
         treatment : str, optional
             Binary treatment indicator column.
         covariates : list of str, optional
             Predetermined covariates used in both local nuisance models.
+        ylags, dylags : int, default 0
+            Predetermined outcome-level and outcome-change lags included in
+            both nuisance bases. Placebo-overlapping changes are omitted and
+            recorded rather than mechanically fitting a lead for propensity
+            and doubly robust methods. The RA benchmark retains the Dube et al.
+            convention so it remains numerically comparable with ``LPDID``.
+        absorb : list of str, optional
+            Categorical factors expanded into a deterministic dummy basis for
+            both nuisance models.
+        post_pooled, pre_pooled : int or length-2 tuple, optional
+            Diff-diff-style custom pooled windows. When omitted, the public
+            pre/post rows use the complete requested event-study windows.
+        only_event, only_pooled : bool, default False
+            Restrict the public result surface while retaining the complete
+            internal calculation needed for valid aggregates.
+        first_treat : str, optional
+            First-treatment period column (0 for never-treated). This is an
+            advanced alternative to supplying the observed treatment path.
         ps_covariates, or_covariates : list of str, optional
             Advanced overrides for the propensity-score and outcome-regression
             bases. When omitted, each falls back to ``covariates``.
@@ -2139,6 +2529,70 @@ class DRLPDID:
             when ``inference='multiplier'``), ``scalars``, and
             ``print_summary()``.
         """
+        if survey_design is not None:
+            raise NotImplementedError(
+                "survey_design is not certified for semiparametric DRLPDID."
+            )
+        if only_event and only_pooled:
+            raise ValueError("only_event and only_pooled cannot both be True.")
+        for name, value in (("ylags", ylags), ("dylags", dylags)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
+        if dylags and self.n_lagged_outcome_changes:
+            raise ValueError(
+                "Use fit(..., dylags=) or the legacy constructor "
+                "outcome_change_lags=, not both."
+            )
+        resolved_dylags = int(dylags or self.n_lagged_outcome_changes)
+        pooled_pre_horizons = self._resolve_pooled_horizons(
+            pre_pooled, kind="pre"
+        )
+        pooled_post_horizons = self._resolve_pooled_horizons(
+            post_pooled, kind="post"
+        )
+        if pre_pooled is not None and not pooled_pre_horizons and not only_event:
+            raise ValueError(
+                "pooled pre window is empty; use only_event=True or request "
+                "at least one lead before h=-1."
+            )
+        if post_pooled is not None and self.policy_window is not None:
+            raise ValueError(
+                "Use fit(..., post_pooled=) or the legacy constructor "
+                "aggregate_window=, not both."
+            )
+
+        covariates = list(covariates or [])
+        absorb = list(absorb or [])
+        data_for_fit = data
+        absorbed_dummy_columns: list[str] = []
+        if absorb:
+            missing_columns = [column for column in absorb if column not in data]
+            if missing_columns:
+                raise ValueError(f"Absorbed columns not found: {missing_columns}")
+            data_for_fit = data.copy()
+            for factor_number, column in enumerate(absorb):
+                values = data_for_fit[column]
+                dummies = pd.get_dummies(
+                    values,
+                    prefix=f"__pyd_dr_absorb_{factor_number}",
+                    drop_first=True,
+                    dtype=float,
+                )
+                if not dummies.empty:
+                    dummies.loc[values.isna(), :] = float("nan")
+                    data_for_fit = pd.concat([data_for_fit, dummies], axis=1)
+                    absorbed_dummy_columns.extend(dummies.columns.astype(str))
+            covariates.extend(absorbed_dummy_columns)
+
+        resolved_ps_covariates = (
+            None if ps_covariates is None
+            else list(ps_covariates) + absorbed_dummy_columns
+        )
+        resolved_or_covariates = (
+            None if or_covariates is None
+            else list(or_covariates) + absorbed_dummy_columns
+        )
+
         if self.design == "absorbing" and first_treat is None and treatment is None:
             raise ValueError(
                 "Absorbing treatment requires either first_treat or the "
@@ -2149,23 +2603,28 @@ class DRLPDID:
                 "design='switching' requires the observed binary treatment path."
             )
         if self.cluster is not None:
-            check_columns(data, [self.cluster])
-            if self.cluster != unit:
-                unit_to_cluster = data.groupby(unit, sort=False)[self.cluster].nunique(dropna=False)
-                cluster_to_unit = data.groupby(self.cluster, sort=False)[unit].nunique(dropna=False)
-                if (unit_to_cluster != 1).any() or (cluster_to_unit != 1).any():
-                    raise NotImplementedError(
-                        "The certified implementation currently requires cluster to "
-                        "equal unit (or be a one-to-one relabeling). Coarser clusters "
-                        "require separately validated influence aggregation."
-                    )
+            check_columns(data_for_fit, [self.cluster])
+            if data_for_fit[self.cluster].isna().any():
+                raise ValueError("The cluster column contains missing values.")
+            unit_to_cluster = data_for_fit.groupby(unit, sort=False)[self.cluster].nunique(
+                dropna=False
+            )
+            if (unit_to_cluster != 1).any():
+                raise ValueError(
+                    "Each panel unit must belong to exactly one inference cluster."
+                )
 
         compute_influence = self.inference in {"cluster", "multiplier"}
         core = self._fit_core(
-            data, outcome, unit, time, first_treat, treatment, covariates,
+            data_for_fit, outcome, unit, time, first_treat, treatment, covariates,
             compute_influence=compute_influence,
-            _ps_covariates=ps_covariates,
-            _or_covariates=or_covariates,
+            _ps_covariates=resolved_ps_covariates,
+            _or_covariates=resolved_or_covariates,
+            _n_lagged_outcome_changes=resolved_dylags,
+            _n_lagged_outcome_levels=int(ylags),
+            _absorbed_columns=absorb,
+            _pooled_pre_horizons=pooled_pre_horizons,
+            _pooled_post_horizons=pooled_post_horizons,
         )
         event_df = core["event_study"].copy()
         scalars = core["scalars"].copy()
@@ -2257,8 +2716,13 @@ class DRLPDID:
                 fitted = self._fit_core(
                     boot_df, outcome, unit, time, first_treat, treatment,
                     covariates, compute_influence=False,
-                    _ps_covariates=ps_covariates,
-                    _or_covariates=or_covariates,
+                    _ps_covariates=resolved_ps_covariates,
+                    _or_covariates=resolved_or_covariates,
+                    _n_lagged_outcome_changes=resolved_dylags,
+                    _n_lagged_outcome_levels=int(ylags),
+                    _absorbed_columns=absorb,
+                    _pooled_pre_horizons=pooled_pre_horizons,
+                    _pooled_post_horizons=pooled_post_horizons,
                 )
                 return {
                     "event_study": fitted["event_study"],
@@ -2267,13 +2731,14 @@ class DRLPDID:
 
             boot = run_cluster_bootstrap(
                 _refit,
-                data.copy(),
-                unit,
+                data_for_fit.copy(),
+                self.cluster or unit,
                 self.n_bootstrap,
                 self.alpha,
                 rng,
                 original,
                 min_success_rate=self.min_bootstrap_success,
+                panel_unit=unit,
             )
             for frame_name, boot_name, key in (
                 ("event", "event_boot", "horizon"),
@@ -2307,8 +2772,12 @@ class DRLPDID:
                 frame["conf_low"] = frame["ci_lower"]
                 frame["conf_high"] = frame["ci_upper"]
         event_study_stable = pd.DataFrame()
+        if only_event:
+            scalars = scalars.iloc[0:0].copy()
+        if only_pooled:
+            event_df = event_df.iloc[0:0].copy()
 
-        return DRLPDIDResults(
+        result = DRLPDIDResults(
             estimator_name=core["metadata"]["estimator_label"],
             n_obs=core["n_obs"],
             n_treated_units=core["n_treated_units"],
@@ -2330,6 +2799,9 @@ class DRLPDID:
             covariates=core["metadata"].get("covariates", list(covariates or [])),
             target_estimand="ATT",
         )
+        self.results_ = result
+        self.is_fitted_ = True
+        return result
 
 
 # ---------------------------------------------------------------------------

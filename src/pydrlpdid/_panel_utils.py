@@ -222,6 +222,7 @@ def prepare_panel(
     nonabsorbing: bool = False,
     n_lagged_outcome_changes: int = 0,
     *,
+    n_lagged_outcome_levels: int = 0,
     left_censoring: str = "error",
     time_policy: str = "calendar",
     history_policy: str = "observed",
@@ -379,6 +380,8 @@ def prepare_panel(
         df["D_treat"] = ((df["_first_treat"] > 0) & (df[time] == df["_first_treat"])).astype(int)
 
     df["dy"] = df[outcome] - lag(df, unit, outcome, 1)
+    for k in range(1, int(max(n_lagged_outcome_levels, 0)) + 1):
+        df[f"ly{k}"] = lag(df, unit, outcome, k)
     for k in range(1, int(max(n_lagged_outcome_changes, 0)) + 1):
         df[f"ldy{k}"] = lag(df, unit, "dy", k)
 
@@ -396,12 +399,17 @@ def prepare_panel(
 # ---------------------------------------------------------------------------
 
 def _all_pre_base(df: pd.DataFrame, outcome: str, unit: str) -> pd.Series:
-    obsnum = df.groupby(unit, sort=False).cumcount() + 1
-    cumy = df.groupby(unit, sort=False)[outcome].cumsum()
-    out = lag(pd.DataFrame({"_cumy": cumy, unit: df[unit]}), unit, "_cumy", 1) / (obsnum - 1)
-    out = pd.Series(out, index=df.index)
-    out.loc[obsnum <= 1] = np.nan
-    return out
+    # Mean of all AVAILABLE strictly-prior outcomes.  Missing outcomes neither
+    # contribute to the numerator nor to the denominator; counting rows would
+    # change PMD on an unbalanced or item-missing panel.
+    values = pd.to_numeric(df[outcome], errors="coerce")
+    filled = values.fillna(0.0)
+    nonmissing = values.notna().astype(int)
+    prior_sum = filled.groupby(df[unit], sort=False).cumsum() - filled
+    prior_count = (
+        nonmissing.groupby(df[unit], sort=False).cumsum() - nonmissing
+    )
+    return prior_sum / prior_count.replace(0, np.nan)
 
 
 def compute_base_series(
@@ -581,11 +589,18 @@ def build_local_sample(
     elif clean_control == "first_entry":
         # Non-absorbing, Section 4.2.2 (eq. 12):
         # ΔD_it = 1  AND  D_{i,t-j} = 0 for j ≥ 1 (first-time entry)
-        # AND (for h≥0) stays treated through t+h
+        # AND (for h≥0) stays treated at every date from t through t+h.
         newly_treated = s["D_treat"] == 1
         first_time = s["_first_treat"] == s[time]  # never treated before t
         if h >= 0:
-            stays_treated = lead(s, unit, "_treat", h).fillna(0) == 1
+            stay_h = H if fixed_comp else int(h)
+            stays_treated = pd.Series(True, index=s.index)
+            for j in range(0, stay_h + 1):
+                stays_treated &= lead(s, unit, "_treat", j).fillna(0) == 1
+                if "_treat_obs" in s.columns:
+                    stays_treated &= (
+                        lead(s, unit, "_treat_obs", j).fillna(0) == 1
+                    )
         else:
             stays_treated = pd.Series(True, index=s.index)
         treat_mask = newly_treated & first_time & stays_treated
@@ -642,8 +657,9 @@ def build_local_sample(
         # The restriction binds only for post-horizons (h>=0); pre-period
         # placebo rows use the clean-event set unchanged.
         if switch_in == "sustained" and h >= 0:
+            sustain_h = H if fixed_comp else int(h)
             stay_on = pd.Series(True, index=s.index)
-            for j in range(0, h + 1):
+            for j in range(0, sustain_h + 1):
                 stay_on = stay_on & (lead(s, unit, "_treat", j).fillna(0) == 1)
                 if "_treat_obs" in s.columns:
                     stay_on = stay_on & (lead(s, unit, "_treat_obs", j).fillna(0) == 1)
@@ -664,7 +680,7 @@ def build_local_sample(
     if clean_control == "never_treated":
         ctrl_mask = s["_never_treated"] == 1
 
-    elif clean_control in {"not_yet_treated", "first_entry"}:
+    elif clean_control == "not_yet_treated":
         if fixed_comp:
             # Fixed control membership: untreated at t+H for every horizon
             ctrl_mask = ctrl_fixed
@@ -674,6 +690,22 @@ def build_local_sample(
         else:
             # Pre-periods: not treated at t
             ctrl_mask = s["_treat"] == 0
+
+    elif clean_control == "first_entry":
+        # Equation (12) compares a first-time entrant with units that have
+        # never entered treatment through the target horizon.  Checking only
+        # D_{t+h}=0 would incorrectly admit previously-treated units that have
+        # switched off.  `_first_treat` records the first observed treatment
+        # date, so this restriction also implies D_{t-1}=D_t=...=D_{t+h}=0.
+        target_h = H if fixed_comp else max(int(h), 0)
+        target_time = s[time] + target_h
+        ctrl_mask = (
+            (s["_first_treat"] == 0)
+            | (s["_first_treat"] > target_time)
+        )
+        ctrl_mask &= s["_treat"] == 0
+        if "_treat_obs" in s.columns:
+            ctrl_mask &= s["_treat_obs"] == 1
 
     elif clean_control == "stabilized":
         if effect_stabilization is None:

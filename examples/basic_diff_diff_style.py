@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from pydrlpdid import DRLPDID
+from pydrlpdid import DRLPDID, LPDID
 
 
 def make_panel(seed: int = 123) -> pd.DataFrame:
@@ -30,6 +30,27 @@ def make_panel(seed: int = 123) -> pd.DataFrame:
 
 if __name__ == "__main__":
     df = make_panel()
+
+    benchmark = LPDID(
+        pre_window=3,
+        post_window=3,
+        control_group="clean",
+        reweight=True,
+        cluster="id",
+        pre_aggregation="all",
+        post_aggregation="all",
+    ).fit(
+        df,
+        outcome="y",
+        unit="id",
+        time="year",
+        treatment="treated",
+        covariates=["x"],
+    )
+    print(benchmark.summary())
+    print("\nLP-DiD pre/post aggregates:")
+    print(benchmark.aggregates)
+
     result = DRLPDID(
         estimation_method="dr-ipt",
         pre_window=3,
@@ -37,6 +58,8 @@ if __name__ == "__main__":
         control_group="clean",
         cluster="id",
         inference="cluster",
+        pre_aggregation="all",
+        post_aggregation="all",
     ).fit(
         df,
         outcome="y",
@@ -46,10 +69,12 @@ if __name__ == "__main__":
         covariates=["x"],
     )
 
-    print(result.summary())
+    print("\n" + result.summary())
     print("\nEvent-study effects:")
     print(result.to_dataframe(level="event_study"))
     print("\nPre/post aggregates:")
-    print(result.to_dataframe(level="pooled"))
-    print(f"\nPost-treatment ATT: {result.att:.4f}")
+    print(result.to_dataframe(level="aggregates"))
+    comparison = result.aggregate("post", "event_weighted")
+    print(f"\nPooled post-treatment ATT: {result.att:.4f}")
+    print(f"Event-weighted comparison ATT: {comparison['estimate']:.4f}")
 

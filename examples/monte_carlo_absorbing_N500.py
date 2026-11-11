@@ -128,23 +128,22 @@ def fit_lpdid(
     panel: pd.DataFrame, covariates: list[str] | None
 ) -> tuple[float, float]:
     result = LPDID(
-        target_estimand="rw",
-        base_period=-1,
-        clean_control="not_yet_treated",
+        pre_window=1,
+        post_window=H_POST,
+        control_group="clean",
+        reweight=True,
         inference="cluster",
-        max_pre=1,
-        max_post=H_POST,
-        support_policy="supported_subset",
     ).fit(
-        panel,
+        panel.assign(
+            treatment=((panel["g"] > 0) & (panel["t"] >= panel["g"])).astype(int)
+        ),
         outcome="y",
         unit="id",
         time="t",
-        first_treat="g",
+        treatment="treatment",
         covariates=covariates,
     )
-    row = scalar_row(result.scalars)
-    return float(row["estimate"]), float(row["se"])
+    return float(result.att), float(result.se)
 
 
 def fit_local_att(

@@ -20,9 +20,8 @@ DRLPDID
     simultaneous event-study bands; clustering is at the unit level.
 
 LPDID
-    Benchmark LP-DiD estimator (variance-weighted, reweighted, and
-    regression-adjustment estimands; absorbing and non-absorbing clean-control
-    rules). Provided here as the base method and for benchmarking.
+    Literature-standard LP-DiD estimator, using the ``diff-diff`` constructor,
+    fit vocabulary, pooled summaries, and analytic inference conventions.
 
 Utilities
 ---------
@@ -51,7 +50,7 @@ Sant'Anna, P. H. C., & Zhao, J. (2020). Doubly robust difference-in-differences
     estimators. *Journal of Econometrics*, 219, 101–122.
 """
 
-from .lpdid import LPDID
+from ._lpdid_api import LPDID
 from .drlpdid import DRLPDID
 from ._plotting import plot_event_study
 from ._results import LPDIDResults, DRLPDIDResults
@@ -59,7 +58,7 @@ from ._errors import (DRLPDIDError, PanelValidationError, TreatmentValidationErr
                       SupportError, NuisanceConvergenceError, JacobianError,
                       InferenceError, ExperimentalFeatureError)
 
-__version__ = "0.8.0rc3"
+__version__ = "0.8.1"
 
 __all__ = [
     "DRLPDID",

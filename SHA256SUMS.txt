@@ -1,3 +1,8 @@
-294696a6e697b15aa36fbdefacd6c234041aa075c2abf72588206f0202ff5900  /mnt/data/pydrlpdid_GitHub_REPLACEMENT_v0.7.2/dist/pydrlpdid-0.7.2-py3-none-any.whl
+294696a6e697b15aa36fbdefacd6c234041aa075c2abf72588206f0202ff5900  dist/pydrlpdid-0.7.2-py3-none-any.whl
 0a9f1b54172d78bfe9d304905f3f88c01304414a6d7c7ee0fdae1df5afc96c39  dist/pydrlpdid-0.8.0rc2-py3-none-any.whl
 a3db539fb861364180c48b89a871005c319550fe40bb83877a556c784297e02c  dist/pydrlpdid-0.8.0rc3-py3-none-any.whl
+2746bfae3ac99b279fa8b55c8439d99cd05b76300945836aecaa65d125d09d34  dist/pydrlpdid-0.8.0rc4-py3-none-any.whl
+19514da4c661b8f8f9fd2de6a9005b6eb40345939f9a3c300dc9a36a703484a3  dist/pydrlpdid-0.8.0rc5-py3-none-any.whl
+b0a6a01b2b8ab32ab6f2dbb588df0e2404eab378f7f1ffa925b6882162bd2e8e  dist/pydrlpdid-0.8.0rc6-py3-none-any.whl
+8d22578fb9805423a80b01990b68bc8fd66cf04237edd87e89aec96b6a88f395  dist/pydrlpdid-0.8.0rc7-py3-none-any.whl
+92c76c445714474cefcadd84cec28288069e683ed324902abcaaabce14b64537  dist/pydrlpdid-0.8.1-py3-none-any.whl
