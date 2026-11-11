@@ -59,7 +59,7 @@ from ._errors import (DRLPDIDError, PanelValidationError, TreatmentValidationErr
                       SupportError, NuisanceConvergenceError, JacobianError,
                       InferenceError, ExperimentalFeatureError)
 
-__version__ = "0.8.0rc1"
+__version__ = "0.8.0rc3"
 
 __all__ = [
     "DRLPDID",

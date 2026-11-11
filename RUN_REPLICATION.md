@@ -1,6 +1,6 @@
 # Running replication files
 
-## 0.8.0rc1 validation
+## 0.8.0 release-candidate validation
 
 From the repository root, run the complete test suite:
 

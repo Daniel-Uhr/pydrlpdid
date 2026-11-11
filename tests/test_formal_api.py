@@ -54,17 +54,21 @@ def switching_panel():
 
 class FormalAPITests(unittest.TestCase):
     def test_version_and_constructor_are_narrow(self):
-        self.assertEqual(__version__, "0.8.0rc1")
+        self.assertEqual(__version__, "0.8.0rc3")
         parameters = set(inspect.signature(DRLPDID).parameters)
         self.assertEqual(
             parameters,
             {
                 "estimation_method",
+                "pre_window",
                 "design",
                 "control_group",
+                "cluster",
+                "non_absorbing",
                 "stabilization_window",
                 "horizons",
                 "post_window",
+                "aggregate_window",
                 "post_aggregation",
                 "outcome_change_lags",
                 "or_slope_structure",
@@ -72,7 +76,9 @@ class FormalAPITests(unittest.TestCase):
                 "left_censoring",
                 "small_sample_correction",
                 "inference",
+                "bootstrap_weights",
                 "n_bootstrap",
+                "min_bootstrap_success",
                 "alpha",
                 "seed",
             },
@@ -131,8 +137,9 @@ class FormalAPITests(unittest.TestCase):
         )
         base = multiplier.event_study.set_index("horizon").loc[-1]
         self.assertEqual(base["estimate"], 0.0)
-        self.assertEqual(base["ci_lower"], 0.0)
-        self.assertEqual(base["ci_upper"], 0.0)
+        self.assertTrue(np.isnan(base["se"]))
+        self.assertTrue(np.isnan(base["ci_lower"]))
+        self.assertTrue(np.isnan(base["ci_upper"]))
 
     def test_complete_prespecified_scalar(self):
         df = absorbing_panel()

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.0rc3
+
+- Makes `small_sample_correction="cr1"` the default for DRLPDID and LPDID;
+  the only alternative is the uncorrected cluster sandwich (`"none"`).
+- Uses Student `t` reference tails with target-specific `G-1` degrees of
+  freedom for analytic event-study and aggregate inference.
+- Uses one common full-DR CR1 reference dimension across the five DRLPDID
+  estimators, preserving the IPT/DR-IPT identity under a nested OR basis.
+- Records cluster counts, degrees of freedom, and critical values in reported
+  analytic results; the normalized base period now carries no inference.
+
+## 0.8.0rc2
+
+- Adds a diff-diff-compatible public surface with `pre_window`, integer
+  `post_window`, `control_group="clean"`, `cluster`, and binary `treatment`.
+- Infers the largest data-supported event-time grid when windows are omitted;
+  preserves `horizons=` and tuple-valued `post_window` for legacy replication.
+- Exposes pre/post aggregate tables and `att`, `se`, `p_value`, `conf_int`, and
+  `to_dataframe()` result aliases.
+- Exposes `non_absorbing="first_entry"` alongside effect stabilization.
+- Exposes Rademacher, Mammen, and Webb multiplier weights and adds paired
+  cluster bootstrap with explicit success diagnostics. Cluster bootstrap is
+  marked experimental pending a larger outer coverage experiment.
+- Requires an explicit `post_aggregation` whenever a nondefault
+  `aggregate_window` is requested.
+
 ## 0.8.0rc1
 
 - Separates observed treatment history from the explicit `diff_diff`
@@ -10,7 +36,6 @@
   alias in the panel utility.
 - Makes the common OR slope the default and exposes calendar-interacted slopes
   by name.
-- Requires an explicit `post_aggregation` whenever `post_window` is requested.
 - Uses one RA design for point estimation and influence-function inference.
 - Applies optional CR1 scaling to the complete cluster influence function.
 - Adds multiplier inference for both pooled and mean-of-horizons scalars.

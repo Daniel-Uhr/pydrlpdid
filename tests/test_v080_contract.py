@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.stats import t as student_t
 
 from pydrlpdid import DRLPDID, LPDID
 from pydrlpdid._errors import JacobianError
@@ -13,6 +14,30 @@ from test_formal_api import absorbing_panel, switching_panel
 
 
 FIT = dict(outcome="y", unit="id", time="time", first_treat="g")
+
+
+def large_first_entry_panel(seed=321):
+    rng = np.random.default_rng(seed)
+    paths = [
+        [0, 0, 0, 1, 1, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 1, 1, 1, 1, 1, 1],
+        [0, 0, 0, 0, 1, 1, 0, 0],
+        [0, 0, 1, 1, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0, 1, 1, 1],
+    ]
+    rows = []
+    unit = 0
+    for _ in range(20):
+        for path in paths:
+            x = rng.normal()
+            alpha = rng.normal()
+            for time, treatment in enumerate(path, start=1):
+                y = alpha + 0.3 * time + 0.2 * x * time + 1.5 * treatment
+                y += rng.normal(scale=0.4)
+                rows.append((unit, time, treatment, x, y))
+            unit += 1
+    return pd.DataFrame(rows, columns=["id", "time", "w", "x", "y"])
 
 
 def test_post_window_requires_an_explicit_estimand():
@@ -73,6 +98,75 @@ def test_cr1_scales_the_full_influence_representation():
         assert corrected.loc[h, "se"] == pytest.approx(
             factor * supported.loc[h, "se"], rel=1e-8, abs=1e-10
         )
+
+
+def test_cr1_is_the_default_and_none_is_the_only_alternative():
+    data = absorbing_panel()
+    default = DRLPDID(
+        estimation_method="dr-ipw", horizons=(-2, 1), inference="cluster",
+    ).fit(data, covariates=["x"], **FIT)
+    explicit = DRLPDID(
+        estimation_method="dr-ipw", horizons=(-2, 1),
+        small_sample_correction="cr1", inference="cluster",
+    ).fit(data, covariates=["x"], **FIT)
+    uncorrected = DRLPDID(
+        estimation_method="dr-ipw", horizons=(-2, 1),
+        small_sample_correction="none", inference="cluster",
+    ).fit(data, covariates=["x"], **FIT)
+    np.testing.assert_allclose(
+        default.event_study[["estimate", "se"]],
+        explicit.event_study[["estimate", "se"]],
+        equal_nan=True,
+    )
+    supported = default.event_study["horizon"] != -1
+    assert np.all(
+        default.event_study.loc[supported, "se"].to_numpy()
+        > uncorrected.event_study.loc[supported, "se"].to_numpy()
+    )
+    assert default.metadata["small_sample_correction"] == "cr1"
+    with pytest.raises(ValueError, match="small_sample_correction"):
+        DRLPDID(small_sample_correction="diff_diff")
+
+
+def test_analytic_cluster_inference_uses_t_G_minus_1():
+    result = DRLPDID(
+        estimation_method="ra", horizons=(-2, 1), inference="cluster",
+    ).fit(absorbing_panel(), covariates=["x"], **FIT)
+    row = result.event_study.query("horizon == 0").iloc[0]
+    assert row["df"] == pytest.approx(row["n_clusters"] - 1)
+    expected_p = 2.0 * student_t.sf(abs(row["t_stat"]), row["df"])
+    expected_crit = student_t.ppf(0.975, row["df"])
+    assert row["p_value"] == pytest.approx(expected_p)
+    assert row["critical_value"] == pytest.approx(expected_crit)
+    assert row["ci_lower"] == pytest.approx(
+        row["estimate"] - expected_crit * row["se"]
+    )
+
+
+def test_lpdid_exposes_cr1_and_none_with_invariant_point_estimates():
+    data = absorbing_panel()
+    corrected = LPDID(
+        target_estimand="ra", max_pre=2, max_post=1,
+        small_sample_correction="cr1",
+    ).fit(data, outcome="y", unit="id", time="time",
+          first_treat="g", covariates=["x"])
+    uncorrected = LPDID(
+        target_estimand="ra", max_pre=2, max_post=1,
+        small_sample_correction="none",
+    ).fit(data, outcome="y", unit="id", time="time",
+          first_treat="g", covariates=["x"])
+    supported = corrected.event_study["horizon"] != -1
+    np.testing.assert_allclose(
+        corrected.event_study.loc[supported, "estimate"],
+        uncorrected.event_study.loc[supported, "estimate"],
+    )
+    assert np.all(
+        corrected.event_study.loc[supported, "se"].to_numpy()
+        > uncorrected.event_study.loc[supported, "se"].to_numpy()
+    )
+    assert corrected.metadata["small_sample_correction"] == "cr1"
+    with pytest.raises(ValueError, match="small_sample_correction"):
+        LPDID(small_sample_correction="diff_diff")
 
 
 def test_condition_limit_is_enforced():
@@ -187,4 +281,141 @@ def test_separate_nuisance_bases_are_public_and_recorded():
     )
     assert result.metadata["ps_covariates"] == ["x"]
     assert result.metadata["or_covariates"] == ["x", "x2"]
+
+
+def test_diff_diff_style_absorbing_api_and_results_surface():
+    data = absorbing_panel()
+    result = DRLPDID(
+        estimation_method="dr-ipt",
+        pre_window=2,
+        post_window=2,
+        control_group="clean",
+        cluster="id",
+        inference="cluster",
+    ).fit(
+        data,
+        outcome="y",
+        unit="id",
+        time="time",
+        treatment="w",
+        covariates=["x"],
+    )
+    assert set(result.pooled["window"]) == {"pre", "post"}
+    assert np.isfinite(result.att)
+    assert np.isfinite(result.se)
+    assert np.isfinite(result.p_value)
+    assert np.isfinite(result.conf_int).all()
+    assert "coefficient" in result.event_study
+    assert "coefficient" in result.to_dataframe(level="pooled")
+
+
+def test_omitted_windows_use_the_data_supported_grid():
+    result = DRLPDID(
+        estimation_method="ra", inference="cluster"
+    ).fit(
+        absorbing_panel(), outcome="y", unit="id", time="time",
+        treatment="w", covariates=["x"],
+    )
+    assert result.metadata["pre_window"] == 4
+    assert result.metadata["post_window"] == 5
+    assert result.event_study["horizon"].min() == -4
+    assert result.event_study["horizon"].max() == 5
+
+
+@pytest.mark.parametrize("method", ["ra", "ipw", "ipt", "dr-ipw", "dr-ipt"])
+def test_new_and_legacy_absorbing_surfaces_are_numerically_identical(method):
+    data = absorbing_panel()
+    legacy = DRLPDID(
+        estimation_method=method,
+        horizons=(-2, 2),
+        post_window=(0, 2),
+        post_aggregation="pooled",
+        inference="cluster",
+    ).fit(data, covariates=["x"], **FIT)
+    modern = DRLPDID(
+        estimation_method=method,
+        pre_window=2,
+        post_window=2,
+        post_aggregation="pooled",
+        control_group="clean",
+        cluster="id",
+        inference="cluster",
+    ).fit(
+        data, outcome="y", unit="id", time="time",
+        treatment="w", covariates=["x"],
+    )
+    pd.testing.assert_frame_equal(
+        legacy.event_study[["horizon", "estimate", "se"]].reset_index(drop=True),
+        modern.event_study[["horizon", "estimate", "se"]].reset_index(drop=True),
+        check_exact=False,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert legacy.att == pytest.approx(modern.att, rel=1e-12, abs=1e-12)
+    assert legacy.se == pytest.approx(modern.se, rel=1e-12, abs=1e-12)
+
+
+@pytest.mark.parametrize("weights", ["rademacher", "mammen", "webb"])
+def test_all_multiplier_weights_are_exposed(weights):
+    result = DRLPDID(
+        estimation_method="ra",
+        pre_window=2,
+        post_window=1,
+        inference="multiplier",
+        bootstrap_weights=weights,
+        n_bootstrap=19,
+        seed=7,
+    ).fit(absorbing_panel(), treatment="w", covariates=["x"],
+          outcome="y", unit="id", time="time")
+    assert result.metadata["multiplier"]["weight_type"] == weights
+
+
+def test_first_entry_is_public_for_nonabsorbing_treatment():
+    result = DRLPDID(
+        estimation_method="ra",
+        pre_window=2,
+        post_window=1,
+        non_absorbing="first_entry",
+        control_group="clean",
+        left_censoring="drop",
+        inference="cluster",
+    ).fit(
+        switching_panel(), outcome="y", unit="id", time="time", treatment="w"
+    )
+    assert result.metadata["design"] == "switching"
+    assert result.clean_control == "first_entry"
+    assert np.isfinite(result.event_study.query("horizon != -1")["estimate"]).any()
+
+
+@pytest.mark.parametrize("method", ["ra", "ipw", "ipt", "dr-ipw", "dr-ipt"])
+def test_first_entry_runs_for_all_estimation_methods(method):
+    result = DRLPDID(
+        estimation_method=method,
+        pre_window=2,
+        post_window=1,
+        non_absorbing="first_entry",
+        inference="cluster",
+    ).fit(
+        large_first_entry_panel(), outcome="y", unit="id", time="time",
+        treatment="w", covariates=["x"],
+    )
+    supported = result.event_study.query("horizon != -1")
+    assert np.isfinite(supported[["estimate", "se"]].to_numpy()).all()
+
+
+@pytest.mark.parametrize("method", ["ra", "ipw", "ipt", "dr-ipw", "dr-ipt"])
+def test_cluster_bootstrap_is_available_for_all_dr_api_methods(method):
+    result = DRLPDID(
+        estimation_method=method,
+        pre_window=2,
+        post_window=1,
+        inference="cluster_bootstrap",
+        n_bootstrap=3,
+        min_bootstrap_success=2 / 3,
+        seed=11,
+    ).fit(absorbing_panel(), treatment="w", covariates=["x"],
+          outcome="y", unit="id", time="time")
+    assert result.bootstrap_n_requested == 3
+    assert result.bootstrap_n_successful >= 2
+    assert result.bootstrap_failure_rate <= 1 / 3
 

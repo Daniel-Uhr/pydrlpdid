@@ -57,6 +57,7 @@ from ._inference import (
     stacked_influence,
 )
 from ._panel_utils import (
+    analytic_cluster_inference,
     BasePeriod,
     build_local_sample,
     check_columns,
@@ -65,10 +66,8 @@ from ._panel_utils import (
     infer_windows,
     lag,
     lead,
-    p_value_two_sided,
     prepare_panel,
     precompute_ccs,
-    z_crit,
 )
 from ._results import LPDIDResults
 from ._errors import ExperimentalFeatureError, InferenceError
@@ -86,13 +85,12 @@ def _nan_row(h: int) -> dict:
     }
 
 
-def _make_row(h: int, est: float, se: float, z: float) -> dict:
-    t = est / se if np.isfinite(est) and np.isfinite(se) and se > 0 else np.nan
-    p = p_value_two_sided(t) if np.isfinite(t) else np.nan
+def _make_row(
+    h: int, est: float, se: float, alpha: float, n_clusters: int
+) -> dict:
     return {
-        "horizon": int(h), "estimate": est, "se": se, "t_stat": t, "p_value": p,
-        "ci_lower": est - z * se if np.isfinite(est) and np.isfinite(se) else np.nan,
-        "ci_upper": est + z * se if np.isfinite(est) and np.isfinite(se) else np.nan,
+        "horizon": int(h), "estimate": est, "se": se,
+        **analytic_cluster_inference(est, se, alpha, n_clusters),
     }
 
 
@@ -184,6 +182,7 @@ def _influence_linear(
     local: pd.DataFrame, unit: str, time: str,
     controls: List[str], estimand: str,
     pre_rw: Optional[pd.Series] = None,
+    small_sample_correction: str = "cr1",
 ) -> dict:
     """Stacked GMM influence functions for VW/RW."""
     s = local.copy()
@@ -214,7 +213,11 @@ def _influence_linear(
     )
     psi = infl["psi"].reshape(-1)
     _n = int(X.shape[0]); _k = int(X.shape[1]); _G = int(pd.unique(s[unit]).size)
-    _cr1 = np.sqrt((_G / (_G - 1.0)) * ((_n - 1.0) / (_n - _k))) if _G > 1 and _n > _k else 1.0
+    _cr1 = 1.0
+    if small_sample_correction == "cr1" and _G > 1 and _n > _k:
+        _cr1 = np.sqrt(
+            (_G / (_G - 1.0)) * ((_n - 1.0) / (_n - _k))
+        )
     psi = _cr1 * psi
     return {
         "se": se_from_influence(psi),
@@ -302,7 +305,8 @@ def _fit_ra(
 
 
 def _influence_ra(
-    local: pd.DataFrame, unit: str, time: str, controls: List[str]
+    local: pd.DataFrame, unit: str, time: str, controls: List[str],
+    small_sample_correction: str = "cr1",
 ) -> dict:
     """Stacked GMM influence functions for the RA estimator.
 
@@ -334,7 +338,9 @@ def _influence_ra(
     )
     psi = infl["psi"].reshape(-1)
     n = int(len(local)); k = int(len(theta)); g = int(local[unit].nunique())
-    cr1 = np.sqrt((g / (g - 1.0)) * ((n - 1.0) / (n - k))) if g > 1 and n > k else 1.0
+    cr1 = 1.0
+    if small_sample_correction == "cr1" and g > 1 and n > k:
+        cr1 = np.sqrt((g / (g - 1.0)) * ((n - 1.0) / (n - k)))
     psi = cr1 * psi
     return {
         "estimate": mu1,
@@ -356,12 +362,15 @@ def _fit_horizon(
     estimand: str, compute_influence: bool,
     cluster_universe: pd.Index,
     pre_rw: Optional[pd.Series] = None,
+    small_sample_correction: str = "cr1",
 ) -> tuple[float, float, pd.Series]:
     """Estimate ATT-h, SE, and cluster influence for one horizon."""
     zero = pd.Series(0.0, index=cluster_universe)
     if estimand == "ra":
         if compute_influence:
-            infl = _influence_ra(local, unit, time, controls)
+            infl = _influence_ra(
+                local, unit, time, controls, small_sample_correction
+            )
             est = infl["estimate"]
             se = infl["se"]
             psi = infl["psi_by_cluster"].reindex(cluster_universe, fill_value=0.0)
@@ -374,7 +383,10 @@ def _fit_horizon(
         est, se = r["estimate"], r["se"]
         psi = zero
         if compute_influence:
-            infl = _influence_linear(local, unit, time, controls, estimand, pre_rw)
+            infl = _influence_linear(
+                local, unit, time, controls, estimand, pre_rw,
+                small_sample_correction,
+            )
             se = infl["se"]
             psi = infl["psi_by_cluster"].reindex(cluster_universe, fill_value=0.0)
     return est, se, psi
@@ -386,7 +398,8 @@ def _fit_horizon(
 
 def _avg_scalar(
     event_df: pd.DataFrame, psi_by_h: Dict[int, pd.Series],
-    cluster_universe: pd.Index, z: float, compute_influence: bool,
+    clusters_by_h: Dict[int, pd.Index], cluster_universe: pd.Index,
+    alpha: float, compute_influence: bool,
 ) -> tuple[list[dict], Dict[str, pd.Series]]:
     post = event_df.loc[
         (event_df["horizon"] >= 0) & np.isfinite(event_df["estimate"])
@@ -407,12 +420,12 @@ def _avg_scalar(
         scalar_psi["ATT avg"] = pd.Series(
             avg_psi, index=cluster_universe, dtype=float
         )
-    t = avg / se if np.isfinite(se) and se > 0 else np.nan
+    scalar_clusters = set()
+    for h in post_h:
+        scalar_clusters.update(clusters_by_h.get(h, pd.Index([])).tolist())
     return [{
-        "term": "ATT avg", "estimate": avg, "se": se, "t_stat": t,
-        "p_value": p_value_two_sided(t) if np.isfinite(t) else np.nan,
-        "ci_lower": avg - z * se if np.isfinite(se) else np.nan,
-        "ci_upper": avg + z * se if np.isfinite(se) else np.nan,
+        "term": "ATT avg", "estimate": avg, "se": se,
+        **analytic_cluster_inference(avg, se, alpha, len(scalar_clusters)),
     }], scalar_psi
 
 
@@ -505,13 +518,14 @@ def _pooled_scalar(
     df: pd.DataFrame, outcome: str, unit: str, time: str,
     event_df: pd.DataFrame, base_period: BasePeriod,
     clean_control: str, effect_stabilization: Optional[int],
-    controls: List[str], estimand: str, z: float, compute_influence: bool,
+    controls: List[str], estimand: str, alpha: float, compute_influence: bool,
     user_covariates: Optional[List[str]] = None,
     lag_covariates: bool = False,
     control_pool: str = "stabilized_all",
     switch_in: str = "sustained",
     control_window: str = "horizon",
     cluster_universe: Optional[pd.Index] = None,
+    small_sample_correction: str = "cr1",
 ) -> tuple[list[dict], Dict[str, pd.Series]]:
     finite_post = event_df.loc[
         (event_df["horizon"] >= 0) & np.isfinite(event_df["estimate"]), "horizon"
@@ -536,14 +550,19 @@ def _pooled_scalar(
         est = _fit_ra(pl, unit, time, controls)["estimate"]
         se = np.nan
         if compute_influence:
-            infl = _influence_ra(pl, unit, time, controls)
+            infl = _influence_ra(
+                pl, unit, time, controls, small_sample_correction
+            )
             est, se = infl["estimate"], infl["se"]
             scalar_psi["ATT pooled"] = infl["psi_by_cluster"]
     else:
         r = _fit_linear(pl, unit, time, controls, estimand)
         est, se = r["estimate"], r["se"]
         if compute_influence:
-            infl = _influence_linear(pl, unit, time, controls, estimand)
+            infl = _influence_linear(
+                pl, unit, time, controls, estimand,
+                small_sample_correction=small_sample_correction,
+            )
             se = infl["se"]
             scalar_psi["ATT pooled"] = infl["psi_by_cluster"]
 
@@ -552,12 +571,11 @@ def _pooled_scalar(
             cluster_universe, fill_value=0.0
         )
 
-    t = est / se if np.isfinite(se) and se > 0 else np.nan
     return [{
-        "term": "ATT pooled", "estimate": est, "se": se, "t_stat": t,
-        "p_value": p_value_two_sided(t) if np.isfinite(t) else np.nan,
-        "ci_lower": est - z * se if np.isfinite(se) else np.nan,
-        "ci_upper": est + z * se if np.isfinite(se) else np.nan,
+        "term": "ATT pooled", "estimate": est, "se": se,
+        **analytic_cluster_inference(
+            est, se, alpha, int(pl[unit].dropna().nunique())
+        ),
     }], scalar_psi
 
 
@@ -749,6 +767,7 @@ class LPDID:
         time_policy: str = "calendar",
         history_policy: str = "observed",
         pre_weighting: str = "horizon_specific",
+        small_sample_correction: str = "cr1",
     ) -> None:
         self.target_estimand = str(target_estimand).lower()
         if self.target_estimand not in self._VALID_ESTIMANDS:
@@ -804,6 +823,11 @@ class LPDID:
             raise ValueError(
                 "pre_weighting must be 'post_target' or 'horizon_specific'."
             )
+        self.small_sample_correction = str(small_sample_correction).lower()
+        if self.small_sample_correction not in {"none", "cr1"}:
+            raise ValueError(
+                "small_sample_correction must be 'cr1' or 'none'."
+            )
 
     # ------------------------------------------------------------------
     def _prepare(self, data, outcome, unit, time, first_treat, treatment, covariates):
@@ -844,9 +868,9 @@ class LPDID:
             covariates, self.include_lagged_outcome_change,
             self.n_lagged_outcome_changes,
         )
-        z = z_crit(self.alpha)
         cu = pd.Index(df[unit].dropna().unique())  # cluster universe
         psi_by_h: Dict[int, pd.Series] = {}
+        clusters_by_h: Dict[int, pd.Index] = {}
         rows: list[dict] = []
         omitted_overlapping_outcome_controls: dict[int, tuple[str, ...]] = {}
         control_unit_ids: set = set()
@@ -916,6 +940,7 @@ class LPDID:
                     empty_support_horizons.append(int(h))
                 rows.append(_nan_row(h))
                 psi_by_h[int(h)] = pd.Series(0.0, index=cu)
+                clusters_by_h[int(h)] = pd.Index([])
                 continue
 
             cell = local.groupby(time)["D_local"].agg(["sum", "count"])
@@ -923,6 +948,7 @@ class LPDID:
             if unsupported_times and self.support_policy == "strict":
                 rows.append(_nan_row(h))
                 psi_by_h[int(h)] = pd.Series(0.0, index=cu)
+                clusters_by_h[int(h)] = pd.Index([])
                 continue
             if unsupported_times:
                 local = local.loc[~local[time].isin(unsupported_times)].copy()
@@ -958,17 +984,24 @@ class LPDID:
             est, se, psi = _fit_horizon(
                 local, unit, time, controls_h, self.target_estimand,
                 compute_influence, cu, pre_rw=pre_rw,
+                small_sample_correction=self.small_sample_correction,
             )
             psi_by_h[int(h)] = psi
-            rows.append(_make_row(h, est, se, z))
+            clusters_by_h[int(h)] = pd.Index(local[unit].dropna().unique())
+            rows.append(_make_row(
+                h, est, se, self.alpha, len(clusters_by_h[int(h)])
+            ))
 
         # Normalized base-period row (estimate = 0 by construction)
         if isinstance(self.base_period, int):
             rows.append({
-                "horizon": int(self.base_period), "estimate": 0.0, "se": 0.0,
-                "t_stat": np.nan, "p_value": np.nan, "ci_lower": 0.0, "ci_upper": 0.0,
+                "horizon": int(self.base_period), "estimate": 0.0, "se": np.nan,
+                "t_stat": np.nan, "p_value": np.nan,
+                "ci_lower": np.nan, "ci_upper": np.nan,
+                "df": np.nan, "n_clusters": 0, "critical_value": np.nan,
             })
             psi_by_h[int(self.base_period)] = pd.Series(0.0, index=cu)
+            clusters_by_h[int(self.base_period)] = pd.Index([])
 
         event_df = pd.DataFrame(rows).sort_values("horizon").reset_index(drop=True)
 
@@ -987,18 +1020,20 @@ class LPDID:
             )
 
         scalar_rows, psi_by_scalar = _avg_scalar(
-            event_df, psi_by_h, cu, z, compute_influence
+            event_df, psi_by_h, clusters_by_h, cu, self.alpha,
+            compute_influence,
         )
         pooled_rows, pooled_psi = _pooled_scalar(
             df, outcome, unit, time, event_df, self.base_period,
             self.clean_control, self.effect_stabilization, controls,
-            self.target_estimand, z, compute_influence,
+            self.target_estimand, self.alpha, compute_influence,
             user_covariates=covariates,
             lag_covariates=self.lag_covariates,
             control_pool=self.control_pool,
             switch_in=self.switch_in,
             control_window=self.control_window,
             cluster_universe=cu,
+            small_sample_correction=self.small_sample_correction,
         )
         scalar_rows += pooled_rows
         psi_by_scalar.update(pooled_psi)
@@ -1020,6 +1055,8 @@ class LPDID:
             "time_policy": self.time_policy,
             "history_policy": self.history_policy,
             "pre_weighting": self.pre_weighting,
+            "small_sample_correction": self.small_sample_correction,
+            "reference_distribution": "student_t_G_minus_1",
             "omitted_overlapping_outcome_controls": (
                 omitted_overlapping_outcome_controls
             ),
@@ -1170,7 +1207,7 @@ class LPDID:
             label += " [non-absorbing]"
 
         metadata = {
-            "package_version": "0.8.0rc1",
+            "package_version": "0.8.0rc3",
             "estimator_identity": (
                 "dube_2025_lpdid_ra"
                 if self.target_estimand == "ra"
@@ -1187,6 +1224,8 @@ class LPDID:
             "history_policy": core.get("history_policy"),
             "left_censoring": core.get("left_censoring"),
             "pre_weighting": core.get("pre_weighting"),
+            "small_sample_correction": core.get("small_sample_correction"),
+            "reference_distribution": core.get("reference_distribution"),
             "omitted_overlapping_outcome_controls": core.get(
                 "omitted_overlapping_outcome_controls", {}
             ),

@@ -1,4 +1,4 @@
-"""Reproducible Monte Carlo validation for pydrlpdid 0.8.0rc1.
+"""Reproducible Monte Carlo validation for pydrlpdid 0.8.0 release candidates.
 
 The four scenarios have transparent nuisance truth:
 

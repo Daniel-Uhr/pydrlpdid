@@ -24,7 +24,7 @@ Graham, B. S., Pinto, C. C., & Egel, D. (2012).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import warnings
 
 import numpy as np
@@ -35,17 +35,22 @@ from scipy import optimize
 from scipy.special import expit
 
 from ._errors import (
-    NuisanceConvergenceError, JacobianError,
+    NuisanceConvergenceError, JacobianError, InferenceError,
 )
 
-from ._inference import run_multiplier_bootstrap, se_from_influence, stacked_influence
+from ._inference import (
+    run_cluster_bootstrap,
+    run_multiplier_bootstrap,
+    se_from_influence,
+    stacked_influence,
+)
 from ._panel_utils import (
+    analytic_cluster_inference,
     build_local_sample,
     check_columns,
-    p_value_two_sided,
+    infer_windows,
     prepare_panel,
     precompute_ccs,
-    z_crit,
 )
 from ._results import DRLPDIDResults
 
@@ -1194,50 +1199,44 @@ class DRLPDID:
 
     ``estimation_method`` selects ``'ra'``, ``'ipw'``, ``'ipt'``,
     ``'dr-ipw'``, or ``'dr-ipt'`` on one common horizon-specific stack.
-    ``design`` is either absorbing staggered adoption or sustained switch-ins.
-    For absorbing adoption, ``control_group`` is ``'not_yet_treated'``
-    (default) or ``'never_treated'``. For switching,
-    ``stabilization_window`` supplies the clean-history length L and the
-    comparison rule is fixed by the formal design.
+    ``pre_window`` and ``post_window`` follow the public ``diff-diff`` LP-DiD
+    convention. When omitted, the largest data-supported event-time grid is
+    evaluated. ``horizons=(min_h, max_h)`` remains as a compatibility alias.
+    For non-absorbing paths, ``non_absorbing`` is ``'first_entry'`` or
+    ``'effect_stabilization'``.
 
-    ``horizons=(min_h, max_h)`` is inclusive and must contain h=-1 and h=0.
-    ``post_window=(lo, hi)`` optionally requests one prespecified scalar
-    average, reported only when all its horizons are identified.
     ``inference='cluster'`` reports analytic unit-cluster-robust inference;
-    ``'multiplier'`` additionally reports simultaneous Rademacher sup-t bands.
+    ``'multiplier'`` additionally reports simultaneous sup-t bands; and
+    ``'cluster_bootstrap'`` fully re-estimates paired cluster samples.
     """
 
     def __init__(
         self,
         *,
         estimation_method: str = "dr-ipt",
-        design: str = "absorbing",
+        pre_window: Optional[int] = None,
+        post_window: Optional[Union[int, Tuple[int, int]]] = None,
         control_group: Optional[str] = None,
+        cluster: Optional[str] = None,
+        non_absorbing: Optional[str] = None,
         stabilization_window: Optional[int] = None,
-        horizons: Tuple[int, int] = (-5, 10),
-        post_window: Optional[Tuple[int, int]] = None,
+        design: Optional[str] = None,
+        horizons: Optional[Tuple[int, int]] = None,
+        aggregate_window: Optional[Tuple[int, int]] = None,
         post_aggregation: Optional[str] = None,
         outcome_change_lags: int = 0,
         or_slope_structure: str = "common",
         history_policy: str = "observed",
         left_censoring: str = "error",
-        small_sample_correction: str = "none",
-        inference: str = "multiplier",
+        small_sample_correction: str = "cr1",
+        inference: str = "cluster",
+        bootstrap_weights: str = "rademacher",
         n_bootstrap: int = 999,
+        min_bootstrap_success: float = 0.90,
         alpha: float = 0.05,
         seed: Optional[int] = None,
     ) -> None:
-        """Create one of the two designs formally certified by the paper.
-
-        ``design='absorbing'`` implements staggered absorbing adoption with
-        not-yet-treated or never-treated controls. ``design='switching'``
-        implements the sustained-switch-in target: a clean L-period history,
-        treatment sustained through the horizon, and all transition-free
-        local stayers as controls. The base is fixed at h=-1, composition is
-        as observed, support is the set of reference dates containing both an
-        eligible event and an eligible control, and clustering is by panel
-        unit.
-        """
+        """Create a DR-LP-DiD estimator with a diff-diff-compatible surface."""
         methods = {
             "ra": ("ra", None),
             "ipw": ("ipw", "generic"),
@@ -1255,14 +1254,40 @@ class DRLPDID:
         self._family, self._ps_method = methods[em]
         self.dr_method = self._ps_method
 
-        self.design = str(design).lower()
-        if self.design not in {"absorbing", "switching"}:
+        legacy_design = None if design is None else str(design).lower()
+        if legacy_design not in {None, "absorbing", "switching"}:
             raise ValueError("design must be 'absorbing' or 'switching'.")
-        if self.design == "absorbing":
-            self.clean_control = (
-                "not_yet_treated" if control_group is None
-                else str(control_group).lower()
+        non_absorbing_mode = (
+            None if non_absorbing is None else str(non_absorbing).lower()
+        )
+        if non_absorbing_mode not in {
+            None, "first_entry", "effect_stabilization"
+        }:
+            raise ValueError(
+                "non_absorbing must be None, 'first_entry', or "
+                "'effect_stabilization'."
             )
+        if legacy_design == "switching" and non_absorbing_mode is None:
+            non_absorbing_mode = "effect_stabilization"
+        if legacy_design == "absorbing" and non_absorbing_mode is not None:
+            raise ValueError(
+                "design='absorbing' conflicts with a non_absorbing mode."
+            )
+        self.non_absorbing = non_absorbing_mode
+        self.design = "switching" if non_absorbing_mode is not None else "absorbing"
+
+        requested_control = (
+            "clean" if control_group is None else str(control_group).lower()
+        )
+        if self.design == "absorbing":
+            aliases = {"clean": "not_yet_treated", "not_yet_treated": "not_yet_treated",
+                       "never_treated": "never_treated"}
+            if requested_control not in aliases:
+                raise ValueError(
+                    "For absorbing treatment, control_group must be 'clean', "
+                    "'not_yet_treated', or 'never_treated'."
+                )
+            self.clean_control = aliases[requested_control]
             if self.clean_control not in {"not_yet_treated", "never_treated"}:
                 raise ValueError(
                     "For design='absorbing', control_group must be "
@@ -1274,22 +1299,34 @@ class DRLPDID:
                 )
             self.effect_stabilization = None
         else:
-            if control_group is not None:
+            if requested_control != "clean":
                 raise ValueError(
-                    "The switching control group is fixed by the formal design; "
-                    "do not supply control_group."
+                    "Non-absorbing designs use their formally defined clean "
+                    "controls; set control_group='clean'."
                 )
-            if stabilization_window is None:
+            if non_absorbing_mode == "effect_stabilization" and stabilization_window is None:
                 raise ValueError(
-                    "design='switching' requires stabilization_window=L."
+                    "non_absorbing='effect_stabilization' requires "
+                    "stabilization_window=L."
                 )
-            if isinstance(stabilization_window, bool):
-                raise ValueError("stabilization_window must be a positive integer.")
-            L = int(stabilization_window)
-            if L != stabilization_window or L < 1:
-                raise ValueError("stabilization_window must be a positive integer.")
-            self.clean_control = "stabilized"
-            self.effect_stabilization = L
+            if non_absorbing_mode == "first_entry":
+                if stabilization_window is not None:
+                    raise ValueError(
+                        "stabilization_window does not apply to "
+                        "non_absorbing='first_entry'."
+                    )
+                self.clean_control = "first_entry"
+                self.effect_stabilization = None
+            else:
+                if isinstance(stabilization_window, bool):
+                    raise ValueError("stabilization_window must be a positive integer.")
+                L = int(stabilization_window)
+                if L != stabilization_window or L < 1:
+                    raise ValueError("stabilization_window must be a positive integer.")
+                self.clean_control = "stabilized"
+                self.effect_stabilization = L
+        self.control_group = requested_control
+        self.cluster = cluster
         self.history_policy = str(history_policy).lower()
         if self.history_policy not in {"observed", "diff_diff"}:
             raise ValueError("history_policy must be 'observed' or 'diff_diff'.")
@@ -1304,45 +1341,69 @@ class DRLPDID:
                 "'keep_as_control_after_L'."
             )
 
-        try:
-            raw_h_lo, raw_h_hi = horizons[0], horizons[1]
-            h_lo, h_hi = int(raw_h_lo), int(raw_h_hi)
-        except Exception as exc:
-            raise ValueError("horizons must be a pair (min_h, max_h).") from exc
-        if (
-            isinstance(raw_h_lo, bool)
-            or isinstance(raw_h_hi, bool)
-            or h_lo != raw_h_lo
-            or h_hi != raw_h_hi
-        ):
-            raise ValueError("horizons must contain two integers.")
-        if h_lo > -1 or h_hi < 0 or h_hi < h_lo:
+        legacy_scalar_window = post_window if isinstance(post_window, tuple) else None
+        if legacy_scalar_window is not None and aggregate_window is not None:
             raise ValueError(
-                "horizons must include the base h=-1 and at least h=0."
+                "Use aggregate_window or the legacy tuple-valued post_window, not both."
             )
-        self.max_pre = abs(h_lo)
-        self.max_post = h_hi
+        if horizons is not None and (
+            pre_window is not None or (post_window is not None and not isinstance(post_window, tuple))
+        ):
+            raise ValueError(
+                "Use pre_window/post_window or the legacy horizons argument, not both."
+            )
+        if horizons is not None:
+            try:
+                raw_h_lo, raw_h_hi = horizons[0], horizons[1]
+                h_lo, h_hi = int(raw_h_lo), int(raw_h_hi)
+            except Exception as exc:
+                raise ValueError("horizons must be a pair (min_h, max_h).") from exc
+            if (
+                isinstance(raw_h_lo, bool) or isinstance(raw_h_hi, bool)
+                or h_lo != raw_h_lo or h_hi != raw_h_hi
+            ):
+                raise ValueError("horizons must contain two integers.")
+            if h_lo > -1 or h_hi < 0 or h_hi < h_lo:
+                raise ValueError(
+                    "horizons must include the base h=-1 and at least h=0."
+                )
+            self.max_pre, self.max_post = abs(h_lo), h_hi
+            self._automatic_aggregates = False
+        else:
+            def _window(value, name):
+                if value is None:
+                    return None
+                if isinstance(value, bool) or int(value) != value or int(value) < 0:
+                    raise ValueError(f"{name} must be a non-negative integer or None.")
+                return int(value)
+            self.max_pre = _window(pre_window, "pre_window")
+            self.max_post = _window(
+                None if legacy_scalar_window is not None else post_window,
+                "post_window",
+            )
+            self._automatic_aggregates = True
         self.base_period = -1
         self.anticipation = 0
 
-        if post_window is None:
+        requested_aggregate_window = aggregate_window or legacy_scalar_window
+        if requested_aggregate_window is None:
             self.policy_window = None
         else:
             try:
-                raw_lo, raw_hi = post_window[0], post_window[1]
+                raw_lo, raw_hi = requested_aggregate_window[0], requested_aggregate_window[1]
                 lo, hi = int(raw_lo), int(raw_hi)
             except Exception as exc:
-                raise ValueError("post_window must be a pair (lo, hi).") from exc
+                raise ValueError("aggregate_window must be a pair (lo, hi).") from exc
             if (
                 isinstance(raw_lo, bool)
                 or isinstance(raw_hi, bool)
                 or lo != raw_lo
                 or hi != raw_hi
             ):
-                raise ValueError("post_window must contain two integers.")
-            if lo < 0 or hi < lo or hi > self.max_post:
+                raise ValueError("aggregate_window must contain two integers.")
+            if lo < 0 or hi < lo or (self.max_post is not None and hi > self.max_post):
                 raise ValueError(
-                    "post_window must satisfy 0 <= lo <= hi <= max horizon."
+                    "aggregate_window must satisfy 0 <= lo <= hi <= post window."
                 )
             self.policy_window = (lo, hi)
 
@@ -1356,11 +1417,12 @@ class DRLPDID:
         )
         if self.policy_window is not None and post_aggregation is None:
             raise ValueError(
-                "post_window changes the scalar estimand; explicitly set "
+                "aggregate_window changes the scalar estimand; explicitly set "
                 "post_aggregation='pooled' or 'mean_horizons'."
             )
         self.post_aggregation = (
-            None if post_aggregation is None else str(post_aggregation).lower()
+            ("pooled" if self._automatic_aggregates else None)
+            if post_aggregation is None else str(post_aggregation).lower()
         )
         if self.post_aggregation not in {None, "pooled", "mean_horizons"}:
             raise ValueError(
@@ -1371,14 +1433,39 @@ class DRLPDID:
             raise ValueError("small_sample_correction must be 'none' or 'CR1'.")
 
         self.inference = str(inference).lower()
-        if self.inference not in {"cluster", "multiplier"}:
-            raise ValueError("inference must be 'cluster' or 'multiplier'.")
+        if self.inference not in {"cluster", "multiplier", "cluster_bootstrap"}:
+            raise ValueError(
+                "inference must be 'cluster', 'multiplier', or "
+                "'cluster_bootstrap'."
+            )
+        if self.inference == "cluster_bootstrap":
+            warnings.warn(
+                "cluster_bootstrap is experimental in pydrlpdid 0.8.0rc3. "
+                "Use at least 999 replications for reported results and "
+                "inspect bootstrap success diagnostics.",
+                UserWarning,
+                stacklevel=2,
+            )
         if isinstance(n_bootstrap, bool) or int(n_bootstrap) != n_bootstrap:
             raise ValueError("n_bootstrap must be an integer.")
         self.n_bootstrap = int(n_bootstrap)
-        if self.inference == "multiplier" and self.n_bootstrap < 1:
+        if self.inference in {"multiplier", "cluster_bootstrap"} and self.n_bootstrap < 1:
             raise ValueError("n_bootstrap must be at least 1.")
-        self.bootstrap_weights = "rademacher"
+        if self.inference in {"multiplier", "cluster_bootstrap"} and self.n_bootstrap < 99:
+            warnings.warn(
+                "Fewer than 99 bootstrap draws are suitable only for smoke "
+                "testing, not reported inference.",
+                UserWarning,
+                stacklevel=2,
+            )
+        self.bootstrap_weights = str(bootstrap_weights).lower()
+        if self.bootstrap_weights not in {"rademacher", "mammen", "webb"}:
+            raise ValueError(
+                "bootstrap_weights must be 'rademacher', 'mammen', or 'webb'."
+            )
+        self.min_bootstrap_success = float(min_bootstrap_success)
+        if not 0.0 < self.min_bootstrap_success <= 1.0:
+            raise ValueError("min_bootstrap_success must lie in (0, 1].")
         self.alpha = float(alpha)
         if not 0.0 < self.alpha < 1.0:
             raise ValueError("alpha must lie strictly between 0 and 1.")
@@ -1510,17 +1597,49 @@ class DRLPDID:
             and self.small_sample_correction == "cr1"
             and "psi_by_cluster" in result
         ):
-            n = int(result["n_inference_rows"])
-            k = int(result["n_moment_parameters"])
-            g = int(result["n_inference_clusters"])
-            if g <= 1 or n <= k:
-                raise InferenceError(
-                    "CR1 requires at least two clusters and more observations "
-                    f"than moment parameters; got G={g}, n={n}, k={k}."
+            # Use one common full-DR reference dimension across the five
+            # estimators.  Method-specific moment counts would make nested
+            # IPT and DR-IPT receive different finite-sample corrections even
+            # when their influence functions are algebraically identical.
+            ps_formula = _build_formula(
+                "D_local", time, ps_controls,
+                add_time_fe=self.ps_with_time_fe,
+                time_varying_slopes=self.ps_time_varying_slopes,
+            )
+            _, ps_design = patsy.dmatrices(
+                ps_formula, local_sample, return_type="dataframe"
+            )
+            or_formula = _build_formula(
+                "outcome_local", time, or_controls,
+                add_time_fe=True,
+                time_varying_slopes=self.or_time_varying_slopes,
+            )
+            _, or_design = patsy.dmatrices(
+                or_formula, local_sample, return_type="dataframe"
+            )
+            control = local_sample["D_local"].to_numpy(dtype=float) == 0
+            k_reference = int(
+                1
+                + np.linalg.matrix_rank(np.asarray(ps_design, dtype=float))
+                + np.linalg.matrix_rank(
+                    np.asarray(or_design, dtype=float)[control]
                 )
-            factor = float(np.sqrt((g / (g - 1.0)) * ((n - 1.0) / (n - k))))
+            )
+            n = int(result["n_inference_rows"])
+            g = int(result["n_inference_clusters"])
+            if g <= 1 or n <= k_reference:
+                raise InferenceError(
+                    "CR1 requires at least two clusters and more inference "
+                    "rows than reference parameters; "
+                    f"got G={g}, n={n}, K_ref={k_reference}."
+                )
+            factor = float(np.sqrt(
+                (g / (g - 1.0))
+                * ((n - 1.0) / (n - k_reference))
+            ))
             result["psi_by_cluster"] = factor * result["psi_by_cluster"]
             result["se"] = se_from_influence(result["psi_by_cluster"].to_numpy())
+            result["cr1_reference_parameters"] = k_reference
         result["small_sample_factor"] = factor
         return result
 
@@ -1560,7 +1679,7 @@ class DRLPDID:
             check_columns(data, all_base_covariates)
         df = prepare_panel(
             data, outcome, unit, time, first_treat, treatment,
-            nonabsorbing=(self.clean_control == "stabilized"),
+            nonabsorbing=(self.non_absorbing is not None),
             n_lagged_outcome_changes=(
                 self.n_lagged_outcome_changes
                 if self.include_lagged_outcome_change
@@ -1570,9 +1689,14 @@ class DRLPDID:
             time_policy=self.time_policy,
             history_policy=self.history_policy,
         )
-        # The reported grid is the requested grid. Data-unavailable horizons
+        data_max_pre, data_max_post = infer_windows(
+            df, time, self.base_period, None, None
+        )
+        max_pre = data_max_pre if self.max_pre is None else self.max_pre
+        max_post = data_max_post if self.max_post is None else self.max_post
+        # The reported grid is the requested or data-inferred grid.
+        # Data-unavailable horizons
         # remain explicit NaN rows rather than disappearing from the result.
-        max_pre, max_post = self.max_pre, self.max_post
         if self.effect_stabilization is not None:
             df = precompute_ccs(
                 df, unit, int(self.effect_stabilization), max_pre, max_post
@@ -1590,9 +1714,9 @@ class DRLPDID:
         )
         stack_controls = list(dict.fromkeys(ps_controls + or_controls))
         stack_user_covariates = all_base_covariates
-        z = z_crit(self.alpha)
         cluster_universe = pd.Index(df[unit].dropna().unique())
         psi_by_h: Dict[int, pd.Series] = {}
+        clusters_by_h: Dict[int, pd.Index] = {}
         rows: list[dict] = []
         unsupported_horizons: dict[int, str] = {}
         nuisance_diagnostics: dict[int, dict] = {}
@@ -1640,6 +1764,7 @@ class DRLPDID:
                 unsupported_horizons[int(h)] = "empty_or_one_sided_local_stack"
                 rows.append(_nan_row(h))
                 psi_by_h[int(h)] = pd.Series(0.0, index=cluster_universe)
+                clusters_by_h[int(h)] = pd.Index([])
                 continue
 
             # The formal horizon target is defined on supported reference
@@ -1659,6 +1784,7 @@ class DRLPDID:
                 unsupported_horizons[int(h)] = "no_supported_reference_date"
                 rows.append(_nan_row(h))
                 psi_by_h[int(h)] = pd.Series(0.0, index=cluster_universe)
+                clusters_by_h[int(h)] = pd.Index([])
                 continue
 
             event_mask = local["D_local"] == 1
@@ -1707,21 +1833,31 @@ class DRLPDID:
                     or key.startswith("control_odds_")
                     or key in {
                         "control_weight_ess", "small_sample_factor",
+                        "cr1_reference_parameters",
                         "n_moment_parameters", "n_inference_rows",
                         "n_inference_clusters",
                     }
                 )
             }
-            psi_by_h[int(h)] = fit.get(
-                "psi_by_cluster", pd.Series(0.0, index=cluster_universe)
-            ).reindex(cluster_universe, fill_value=0.0)
-            rows.append(_make_row(h, est, se, z, counts=counts))
+            local_psi = fit.get(
+                "psi_by_cluster", pd.Series(0.0, index=pd.Index(local[unit].unique()))
+            )
+            clusters_by_h[int(h)] = pd.Index(local[unit].dropna().unique())
+            psi_by_h[int(h)] = local_psi.reindex(
+                cluster_universe, fill_value=0.0
+            )
+            rows.append(_make_row(
+                h, est, se, self.alpha,
+                int(fit.get("n_inference_clusters", len(clusters_by_h[int(h)]))),
+                counts=counts,
+            ))
 
         if isinstance(self.base_period, int) and self.base_period == -1:
             rows.append({
-                "horizon": -1, "estimate": 0.0, "se": 0.0,
+                "horizon": -1, "estimate": 0.0, "se": np.nan,
                 "t_stat": np.nan, "p_value": np.nan,
-                "ci_lower": 0.0, "ci_upper": 0.0,
+                "ci_lower": np.nan, "ci_upper": np.nan,
+                "df": np.nan, "n_clusters": 0, "critical_value": np.nan,
                 "n_event_rows": 0, "n_event_units": 0,
                 "n_control_rows": 0, "n_control_units": 0,
                 "n_reference_dates": 0,
@@ -1732,6 +1868,7 @@ class DRLPDID:
                     "n_stable_one_control_rows": 0,
                 })
             psi_by_h[-1] = pd.Series(0.0, index=cluster_universe)
+            clusters_by_h[-1] = pd.Index([])
 
         event_df = pd.DataFrame(rows).sort_values("horizon").reset_index(drop=True)
         if unsupported_horizons:
@@ -1743,15 +1880,64 @@ class DRLPDID:
                 stacklevel=2,
             )
 
-        # Scalar summaries
+        # Scalar summaries. New-style calls expose pre/post aggregates by
+        # default; legacy ``horizons=`` calls retain their opt-in behavior.
         scalar_rows: list[dict] = []
         scalar_specs: dict = {}
         psi_by_scalar: Dict[str, pd.Series] = {}
         scalar_missing_horizons: list[int] = []
-        if self.policy_window is not None and self.post_aggregation == "pooled":
-            lo, hi = self.policy_window
+
+        def _cluster_union_size(horizons_for_scalar) -> int:
+            labels = set()
+            for horizon in horizons_for_scalar:
+                labels.update(clusters_by_h.get(int(horizon), pd.Index([])).tolist())
+            return int(len(labels))
+
+        effective_policy_window = self.policy_window
+        if self._automatic_aggregates and effective_policy_window is None:
+            effective_policy_window = (0, max_post)
+
+        if self._automatic_aggregates:
+            requested_pre = list(range(-max_pre, -1))
+            by_h = event_df.set_index("horizon")
+            supported_pre = [
+                h for h in requested_pre
+                if h in by_h.index and np.isfinite(by_h.loc[h, "estimate"])
+            ]
+            if supported_pre:
+                weights_pre = np.full(len(supported_pre), 1.0 / len(supported_pre))
+                estimates_pre = by_h.loc[supported_pre, "estimate"].to_numpy(dtype=float)
+                estimate_pre = float(np.dot(weights_pre, estimates_pre))
+                se_pre = np.nan
+                if compute_influence:
+                    influence_pre = np.column_stack([
+                        psi_by_h[h].reindex(
+                            cluster_universe, fill_value=0.0
+                        ).to_numpy(dtype=float)
+                        for h in supported_pre
+                    ]) @ weights_pre
+                    se_pre = se_from_influence(influence_pre)
+                    psi_by_scalar["pre"] = pd.Series(
+                        influence_pre, index=cluster_universe, dtype=float
+                    )
+                inference_pre = analytic_cluster_inference(
+                    estimate_pre, se_pre, self.alpha,
+                    _cluster_union_size(supported_pre),
+                )
+                scalar_specs["pre"] = (supported_pre, weights_pre)
+                scalar_rows.append({
+                    "term": "pre", "window": "pre",
+                    "aggregation": "mean_horizons",
+                    "estimate": estimate_pre, "se": se_pre,
+                    **inference_pre,
+                    "n_horizons": len(supported_pre),
+                    "horizons": tuple(supported_pre),
+                })
+
+        if effective_policy_window is not None and self.post_aggregation == "pooled":
+            lo, hi = effective_policy_window
             requested = list(range(lo, hi + 1))
-            term = f"ATT pooled [{lo},{hi}]"
+            term = "post" if self._automatic_aggregates else f"ATT pooled [{lo},{hi}]"
             fit_p = self._fit_pooled_post(
                 df, outcome, unit, time, lo, hi,
                 stack_controls, stack_user_covariates, ps_controls, or_controls,
@@ -1772,19 +1958,22 @@ class DRLPDID:
                     psi_by_scalar[term] = fit_p["psi_by_cluster"].reindex(
                         cluster_universe, fill_value=0.0
                     )
-                t_stat = est_p / se_p if np.isfinite(se_p) and se_p > 0 else np.nan
+                inference_p = analytic_cluster_inference(
+                    est_p, se_p, self.alpha,
+                    int(fit_p.get("n_inference_clusters", 0)),
+                )
                 scalar_rows.append({
                     "term": term,
+                    "window": "post",
+                    "aggregation": "pooled",
                     "estimate": est_p,
                     "se": se_p,
-                    "t_stat": t_stat,
-                    "p_value": p_value_two_sided(t_stat) if np.isfinite(t_stat) else np.nan,
-                    "ci_lower": est_p - z * se_p if np.isfinite(se_p) else np.nan,
-                    "ci_upper": est_p + z * se_p if np.isfinite(se_p) else np.nan,
+                    **inference_p,
                     "n_horizons": len(requested),
+                    "horizons": tuple(requested),
                 })
-        elif self.policy_window is not None:
-            lo, hi = self.policy_window
+        elif effective_policy_window is not None:
+            lo, hi = effective_policy_window
             requested = list(range(lo, hi + 1))
             by_h = event_df.set_index("horizon")
             scalar_missing_horizons = [
@@ -1800,7 +1989,10 @@ class DRLPDID:
                 )
             else:
                 weights = np.full(len(requested), 1.0 / len(requested))
-                term = f"ATT policy-window [{lo},{hi}]"
+                term = (
+                    "post" if self._automatic_aggregates
+                    else f"ATT policy-window [{lo},{hi}]"
+                )
                 scalar_specs[term] = (requested, weights)
                 estimates = by_h.loc[requested, "estimate"].to_numpy(dtype=float)
                 estimate = float(np.dot(weights, estimates))
@@ -1816,23 +2008,23 @@ class DRLPDID:
                     psi_by_scalar[term] = pd.Series(
                         influence, index=cluster_universe, dtype=float
                     )
-                t_stat = estimate / se if np.isfinite(se) and se > 0 else np.nan
+                inference_post = analytic_cluster_inference(
+                    estimate, se, self.alpha,
+                    _cluster_union_size(requested),
+                )
                 scalar_rows.append({
                     "term": term,
+                    "window": "post",
+                    "aggregation": "mean_horizons",
                     "estimate": estimate,
                     "se": se,
-                    "t_stat": t_stat,
-                    "p_value": (
-                        p_value_two_sided(t_stat)
-                        if np.isfinite(t_stat) else np.nan
-                    ),
-                    "ci_lower": estimate - z * se if np.isfinite(se) else np.nan,
-                    "ci_upper": estimate + z * se if np.isfinite(se) else np.nan,
+                    **inference_post,
                     "n_horizons": len(requested),
+                    "horizons": tuple(requested),
                 })
 
         metadata: dict = {
-            "package_version": "0.8.0rc1",
+            "package_version": "0.8.0rc3",
             "estimator_identity": f"drlpdid_{self.estimation_method}",
             "estimator_label": (
                 "RA"
@@ -1847,27 +2039,30 @@ class DRLPDID:
             ),
             "design": self.design,
             "estimation_method": self.estimation_method,
-            "control_group": (
-                self.clean_control if self.design == "absorbing" else None
-            ),
+            "control_group": self.control_group,
+            "clean_control_rule": self.clean_control,
+            "non_absorbing": self.non_absorbing,
             "stabilization_window": self.effect_stabilization,
-            "horizons": (-self.max_pre, self.max_post),
+            "horizons": (-max_pre, max_post),
             "evaluated_horizons": (-max_pre, max_post),
+            "pre_window": max_pre,
+            "post_window": max_post,
             "base_period": -1,
-            "post_window": self.policy_window,
+            "aggregate_window": effective_policy_window,
             "post_aggregation": self.post_aggregation,
             "post_window_missing_horizons": scalar_missing_horizons,
             "support": "reference_dates_with_events_and_clean_controls",
             "composition": "as_observed",
-            "cluster_level": "panel_unit",
+            "cluster_level": self.cluster or "panel_unit",
             "inference": self.inference,
             "small_sample_correction": self.small_sample_correction,
+            "reference_distribution": "student_t_G_minus_1",
             "or_slope_structure": self.or_slope_structure,
             "outcome_change_lags": self.n_lagged_outcome_changes,
             "history_policy": self.history_policy,
             "left_censoring": self.left_censoring,
             "multiplier_weights": (
-                "rademacher" if self.inference == "multiplier" else None
+                self.bootstrap_weights if self.inference == "multiplier" else None
             ),
             "event_weighting": (
                 "eligible_switch_in_events"
@@ -1944,15 +2139,27 @@ class DRLPDID:
             when ``inference='multiplier'``), ``scalars``, and
             ``print_summary()``.
         """
-        if self.design == "absorbing" and first_treat is None:
+        if self.design == "absorbing" and first_treat is None and treatment is None:
             raise ValueError(
-                "design='absorbing' requires first_treat. Use 0 for "
-                "never-treated units."
+                "Absorbing treatment requires either first_treat or the "
+                "observed binary treatment path."
             )
         if self.design == "switching" and treatment is None:
             raise ValueError(
                 "design='switching' requires the observed binary treatment path."
             )
+        if self.cluster is not None:
+            check_columns(data, [self.cluster])
+            if self.cluster != unit:
+                unit_to_cluster = data.groupby(unit, sort=False)[self.cluster].nunique(dropna=False)
+                cluster_to_unit = data.groupby(self.cluster, sort=False)[unit].nunique(dropna=False)
+                if (unit_to_cluster != 1).any() or (cluster_to_unit != 1).any():
+                    raise NotImplementedError(
+                        "The certified implementation currently requires cluster to "
+                        "equal unit (or be a one-to-one relabeling). Coarser clusters "
+                        "require separately validated influence aggregation."
+                    )
+
         compute_influence = self.inference in {"cluster", "multiplier"}
         core = self._fit_core(
             data, outcome, unit, time, first_treat, treatment, covariates,
@@ -2003,6 +2210,7 @@ class DRLPDID:
                     "critical_value": critical_value,
                     "weight_type": self.bootstrap_weights,
                     "n_bootstrap": self.n_bootstrap,
+                    "seed": self.seed,
                     "simultaneous_band_horizons": tuple(band_horizons),
                 }
             })
@@ -2035,6 +2243,69 @@ class DRLPDID:
                 core["metadata"]["multiplier"]["scalar_terms"] = tuple(
                     scalar_bootstrapped
                 )
+
+        if self.inference == "cluster_bootstrap":
+            rng = np.random.default_rng(self.seed)
+            original = {
+                "event_index": event_df["horizon"].tolist(),
+                "event_hat": dict(zip(event_df["horizon"], event_df["estimate"])),
+                "scalar_terms": scalars["term"].tolist(),
+                "scalar_hat": dict(zip(scalars["term"], scalars["estimate"])),
+            }
+
+            def _refit(boot_df):
+                fitted = self._fit_core(
+                    boot_df, outcome, unit, time, first_treat, treatment,
+                    covariates, compute_influence=False,
+                    _ps_covariates=ps_covariates,
+                    _or_covariates=or_covariates,
+                )
+                return {
+                    "event_study": fitted["event_study"],
+                    "scalars": fitted["scalars"],
+                }
+
+            boot = run_cluster_bootstrap(
+                _refit,
+                data.copy(),
+                unit,
+                self.n_bootstrap,
+                self.alpha,
+                rng,
+                original,
+                min_success_rate=self.min_bootstrap_success,
+            )
+            for frame_name, boot_name, key in (
+                ("event", "event_boot", "horizon"),
+                ("scalar", "scalar_boot", "term"),
+            ):
+                frame = event_df if frame_name == "event" else scalars
+                merged = frame.merge(
+                    boot[boot_name], on=key, how="left", suffixes=("", "_bootstrap")
+                )
+                for column in ("se", "ci_lower", "ci_upper", "p_value", "t_stat"):
+                    boot_column = f"{column}_bootstrap"
+                    if boot_column in merged:
+                        merged[column] = merged[boot_column]
+                        merged.drop(columns=[boot_column], inplace=True)
+                if frame_name == "event":
+                    event_df = merged
+                else:
+                    scalars = merged
+            core["metadata"]["cluster_bootstrap"] = {
+                "n_requested": boot["n_requested"],
+                "n_successful": boot["n_successful"],
+                "success_rate": boot["success_rate"],
+                "failures": boot["failures"],
+                "interval": "percentile",
+                "seed": self.seed,
+            }
+
+        for frame in (event_df, scalars):
+            if not frame.empty:
+                frame["coefficient"] = frame["estimate"]
+                frame["conf_low"] = frame["ci_lower"]
+                frame["conf_high"] = frame["ci_upper"]
         event_study_stable = pd.DataFrame()
 
         return DRLPDIDResults(
@@ -2081,19 +2352,15 @@ def _make_row(
     h: int,
     est: float,
     se: float,
-    z: float,
+    alpha: float,
+    n_clusters: int,
     counts: Optional[dict] = None,
 ) -> dict:
-    t_stat = est / se if np.isfinite(est) and np.isfinite(se) and se > 0 else np.nan
-    p_val = p_value_two_sided(t_stat) if np.isfinite(t_stat) else np.nan
     row = {
         "horizon": int(h),
         "estimate": est,
         "se": se,
-        "t_stat": t_stat,
-        "p_value": p_val,
-        "ci_lower": est - z * se if np.isfinite(est) and np.isfinite(se) else np.nan,
-        "ci_upper": est + z * se if np.isfinite(est) and np.isfinite(se) else np.nan,
+        **analytic_cluster_inference(est, se, alpha, n_clusters),
     }
     if counts:
         row.update(counts)

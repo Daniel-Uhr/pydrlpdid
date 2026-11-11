@@ -43,7 +43,7 @@ def absorbing_panel(seed=123):
 
 class EstimatorIdentity072Tests(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.8.0rc1")
+        self.assertEqual(__version__, "0.8.0rc3")
 
     def test_dube_ra_and_formal_ra_have_distinct_identities(self):
         data = absorbing_panel()

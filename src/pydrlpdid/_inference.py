@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
@@ -212,6 +213,7 @@ def run_cluster_bootstrap(
     alpha: float,
     rng: np.random.Generator,
     original_estimates: dict,
+    min_success_rate: float = 0.90,
 ) -> dict:
     """Paired cluster bootstrap for event-study paths and scalar summaries."""
     event_index = list(original_estimates["event_index"])
@@ -219,9 +221,16 @@ def run_cluster_bootstrap(
     B_event = {k: [] for k in event_index}
     B_scalar = {k: [] for k in scalar_terms}
 
+    failures: Counter[str] = Counter()
+    n_successful = 0
     for _ in range(n_bootstrap):
         boot_df = resample_clusters(data, unit, rng)
-        boot = fit_func(boot_df)
+        try:
+            boot = fit_func(boot_df)
+        except Exception as exc:  # recorded, never silently treated as a draw
+            failures[type(exc).__name__] += 1
+            continue
+        n_successful += 1
         es = boot["event_study"].set_index("horizon")
         scalar_df = boot.get("scalars", pd.DataFrame())
         sc = (
@@ -234,23 +243,65 @@ def run_cluster_bootstrap(
         for term in scalar_terms:
             B_scalar[term].append(float(sc.loc[term, "estimate"]) if term in sc.index else np.nan)
 
+    success_rate = n_successful / n_bootstrap if n_bootstrap else 0.0
+    if success_rate < float(min_success_rate):
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(failures.items())) or "none recorded"
+        raise RuntimeError(
+            "Cluster bootstrap did not meet the required success rate: "
+            f"{n_successful}/{n_bootstrap} ({success_rate:.1%}) successful; "
+            f"required {float(min_success_rate):.1%}. Failures: {detail}."
+        )
+
     event_rows = []
     for h in event_index:
         draws = np.asarray(B_event[h], dtype=float)
-        se = float(np.nanstd(draws, ddof=1)) if np.isfinite(draws).sum() > 1 else np.nan
+        n_valid = int(np.isfinite(draws).sum())
+        if not np.isfinite(original_estimates["event_hat"][h]):
+            event_rows.append({
+                "horizon": h, "se": np.nan, "ci_lower": np.nan,
+                "ci_upper": np.nan, "p_value": np.nan, "t_stat": np.nan,
+                "n_bootstrap_valid": n_valid,
+            })
+            continue
+        if n_valid / n_bootstrap < float(min_success_rate):
+            raise RuntimeError(
+                f"Cluster bootstrap horizon h={h} has only {n_valid}/{n_bootstrap} "
+                "finite estimates, below min_success_rate."
+            )
+        se = float(np.nanstd(draws, ddof=1)) if n_valid > 1 else np.nan
         lo, hi = percentile_ci(draws, alpha)
         p = bootstrap_p_value(original_estimates["event_hat"][h], draws - np.nanmean(draws))
         t = original_estimates["event_hat"][h] / se if np.isfinite(se) and se > 0 else np.nan
-        event_rows.append({"horizon": h, "se": se, "ci_lower": lo, "ci_upper": hi, "p_value": p, "t_stat": t})
+        event_rows.append({"horizon": h, "se": se, "ci_lower": lo, "ci_upper": hi, "p_value": p, "t_stat": t, "n_bootstrap_valid": n_valid})
 
     scalar_rows = []
     for term in scalar_terms:
         draws = np.asarray(B_scalar[term], dtype=float)
-        se = float(np.nanstd(draws, ddof=1)) if np.isfinite(draws).sum() > 1 else np.nan
+        n_valid = int(np.isfinite(draws).sum())
+        if n_valid / n_bootstrap < float(min_success_rate):
+            raise RuntimeError(
+                f"Cluster bootstrap scalar {term!r} has only "
+                f"{n_valid}/{n_bootstrap} finite estimates, below "
+                "min_success_rate."
+            )
+        se = float(np.nanstd(draws, ddof=1)) if n_valid > 1 else np.nan
         lo, hi = percentile_ci(draws, alpha)
         p = bootstrap_p_value(original_estimates["scalar_hat"][term], draws - np.nanmean(draws))
         t = original_estimates["scalar_hat"][term] / se if np.isfinite(se) and se > 0 else np.nan
-        scalar_rows.append({"term": term, "se": se, "ci_lower": lo, "ci_upper": hi, "p_value": p, "t_stat": t})
+        scalar_rows.append({"term": term, "se": se, "ci_lower": lo, "ci_upper": hi, "p_value": p, "t_stat": t, "n_bootstrap_valid": n_valid})
 
-    return {"event_boot": pd.DataFrame(event_rows, columns=["horizon", "se", "ci_lower", "ci_upper", "p_value", "t_stat"]), "scalar_boot": pd.DataFrame(scalar_rows, columns=["term", "se", "ci_lower", "ci_upper", "p_value", "t_stat"])}
+    return {
+        "event_boot": pd.DataFrame(
+            event_rows,
+            columns=["horizon", "se", "ci_lower", "ci_upper", "p_value", "t_stat", "n_bootstrap_valid"],
+        ),
+        "scalar_boot": pd.DataFrame(
+            scalar_rows,
+            columns=["term", "se", "ci_lower", "ci_upper", "p_value", "t_stat", "n_bootstrap_valid"],
+        ),
+        "n_requested": int(n_bootstrap),
+        "n_successful": int(n_successful),
+        "success_rate": float(success_rate),
+        "failures": dict(failures),
+    }
 

@@ -104,8 +104,62 @@ def z_crit(alpha: float) -> float:
     return float(NormalDist().inv_cdf(1.0 - alpha / 2.0))
 
 
-def p_value_two_sided(t_stat: float) -> float:
-    return float(2.0 * (1.0 - _norm_cdf(abs(float(t_stat)))))
+def critical_value(alpha: float, df: Optional[float] = None) -> float:
+    """Two-sided critical value, using Student t when ``df`` is supplied."""
+    if df is None or not np.isfinite(df):
+        return z_crit(alpha)
+    if float(df) <= 0:
+        return float("nan")
+    from scipy.stats import t as student_t
+    return float(student_t.ppf(1.0 - alpha / 2.0, float(df)))
+
+
+def p_value_two_sided(t_stat: float, df: Optional[float] = None) -> float:
+    """Two-sided p-value, using Student t when ``df`` is supplied."""
+    value = abs(float(t_stat))
+    if df is None or not np.isfinite(df):
+        return float(2.0 * (1.0 - _norm_cdf(value)))
+    if float(df) <= 0:
+        return float("nan")
+    from scipy.stats import t as student_t
+    return float(2.0 * student_t.sf(value, float(df)))
+
+
+def analytic_cluster_inference(
+    estimate: float,
+    se: float,
+    alpha: float,
+    n_clusters: int,
+) -> dict:
+    """Cluster-robust test and interval with Student ``t_{G-1}`` tails."""
+    g = int(n_clusters)
+    df = float(g - 1) if g >= 2 else float("nan")
+    statistic = (
+        float(estimate) / float(se)
+        if np.isfinite(estimate) and np.isfinite(se) and float(se) > 0
+        else float("nan")
+    )
+    crit = critical_value(alpha, df)
+    return {
+        "t_stat": statistic,
+        "p_value": (
+            p_value_two_sided(statistic, df)
+            if np.isfinite(statistic) else float("nan")
+        ),
+        "ci_lower": (
+            float(estimate) - crit * float(se)
+            if np.isfinite(estimate) and np.isfinite(se) and np.isfinite(crit)
+            else float("nan")
+        ),
+        "ci_upper": (
+            float(estimate) + crit * float(se)
+            if np.isfinite(estimate) and np.isfinite(se) and np.isfinite(crit)
+            else float("nan")
+        ),
+        "df": df,
+        "n_clusters": g,
+        "critical_value": crit,
+    }
 
 
 # ---------------------------------------------------------------------------
