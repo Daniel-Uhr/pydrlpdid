@@ -1,6 +1,26 @@
 # Installation on Windows
 
-## Recommended: install from a downloaded repository folder
+## Recommended: install directly from GitHub
+
+With Python 3.10 selected through the Windows Python launcher:
+
+```powershell
+py -3.10 -m pip install --upgrade pip
+py -3.10 -m pip install "git+https://github.com/Daniel-Uhr/pydrlpdid.git"
+```
+
+The package supports Python 3.9 or later. Replace `-3.10` with the desired
+installed version when necessary.
+
+## Clone the repository with Git
+
+```powershell
+git clone https://github.com/Daniel-Uhr/pydrlpdid.git
+cd pydrlpdid
+py -3.10 -m pip install .
+```
+
+## Install from a downloaded repository folder
 
 1. On GitHub, choose **Code > Download ZIP**.
 2. Extract the ZIP.
@@ -8,14 +28,14 @@
 4. Run:
 
 ```powershell
-py -m pip install --upgrade pip
-py -m pip install .
+py -3.10 -m pip install --upgrade pip
+py -3.10 -m pip install .
 ```
 
 Verify the installation:
 
 ```powershell
-py -c "import pydrlpdid; from pydrlpdid import DRLPDID, LPDID; print(pydrlpdid.__version__); print(pydrlpdid.__file__)"
+py -3.10 -c "import pydrlpdid; from pydrlpdid import DRLPDID, LPDID; print(pydrlpdid.__version__); print(pydrlpdid.__file__)"
 ```
 
 The expected release-candidate version is `0.8.0rc3`.
@@ -23,8 +43,8 @@ The expected release-candidate version is `0.8.0rc3`.
 ## Development installation
 
 ```powershell
-py -m pip install -e ".[dev]"
-py -m pytest -q
+py -3.10 -m pip install -e ".[dev]"
+py -3.10 -m pytest -q
 ```
 
 ## Installing a downloaded wheel
@@ -34,5 +54,5 @@ folder. After downloading the wheel from a GitHub Release, open PowerShell in
 the download folder and run:
 
 ```powershell
-py -m pip install .\pydrlpdid-0.8.0rc3-py3-none-any.whl
+py -3.10 -m pip install .\pydrlpdid-0.8.0rc3-py3-none-any.whl
 ```

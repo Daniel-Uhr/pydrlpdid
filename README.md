@@ -7,18 +7,34 @@ horizon-specific comparison stack.
 
 ## Install
 
-From the repository folder containing `pyproject.toml`:
+Install the current release candidate directly from GitHub:
+
+```bash
+python -m pip install "git+https://github.com/Daniel-Uhr/pydrlpdid.git"
+```
+
+On Windows, `py -3.10` can be used to select Python 3.10 explicitly:
 
 ```powershell
+py -3.10 -m pip install "git+https://github.com/Daniel-Uhr/pydrlpdid.git"
+```
+
+Alternatively, clone the project and install it from the repository folder:
+
+```bash
+git clone https://github.com/Daniel-Uhr/pydrlpdid.git
+cd pydrlpdid
+python -m pip install .
+```
+
+For an editable development installation with the test dependencies:
+
+```bash
 python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-If `python` is not Python 3.10 on Windows, use its full executable path:
-
-```powershell
-& "C:\Users\danie\AppData\Local\Programs\Python\Python310\python.exe" -m pip install -e ".[dev]"
-```
+`pydrlpdid` requires Python 3.9 or later. No machine-specific path is required.
 
 ## Minimal use
 

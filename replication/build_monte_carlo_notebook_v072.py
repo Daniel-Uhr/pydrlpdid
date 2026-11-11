@@ -85,12 +85,8 @@ public estimator.
         r"""
 ## 0. Local package and reproducibility
 
-Place this notebook in:
-
-```text
-C:\Users\danie\OneDrive\1 - Pesquisas\0 - DRLPDID\
-pydrlpdid-0.7.2\notebooks
-```
+Place this notebook in the repository's `notebooks` directory and run it from
+the cloned project or its `notebooks` directory.
 
 Run it with the kernel in which the local package dependencies are installed.
 The setup below imports `src/pydrlpdid` from the same project and refuses to run
